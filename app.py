@@ -13,9 +13,9 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
+from sqlalchemy import or_, func
 
 # ---------- Optional external FCM config import ----------
-# Eğer proje kökünde fcm_config.py varsa onu import edip GLOBAL_FCM_SERVER_KEY'e atarız.
 GLOBAL_FCM_SERVER_KEY = None
 try:
     spec = importlib.util.find_spec("fcm_config")
@@ -101,8 +101,8 @@ class Order(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     total_amount = db.Column(db.Float, nullable=False)
-    status = db.Column(db.String(50), default="new")
-    payment_method = db.Column(db.String(50), default="kapida_nakit")  # kapida_kart / kapida_nakit
+    status = db.Column(db.String(50), default="new")  # new, processing, shipped, completed
+    payment_method = db.Column(db.String(50), default="kapida_nakit")  # kapida_kart or kapida_nakit
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     items = db.relationship("OrderItem", backref="order", lazy=True)
 
@@ -147,7 +147,7 @@ def send_fcm_notification(server_key, tokens, title, body, data=None):
         "data": data or {}
     }
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=5)
+        r = requests.post(url, json=payload, headers=headers, timeout=8)
         return {"success": True, "status_code": r.status_code, "response": r.json()}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -243,7 +243,7 @@ def create_category():
     data = request.json or {}
     if "name" not in data:
         return jsonify({"msg": "name gerekli"}), 400
-    if Category.query.filter_by(name=data["name"]).first():
+    if Category.query.filter(func.lower(Category.name) == data["name"].lower()).first():
         return jsonify({"msg": "Kategori zaten var"}), 400
     c = Category(name=data["name"])
     db.session.add(c)
@@ -252,7 +252,7 @@ def create_category():
 
 @app.route("/categories", methods=["GET"])
 def list_categories():
-    cats = Category.query.all()
+    cats = Category.query.order_by(Category.name.asc()).all()
     return jsonify([{"id": c.id, "name": c.name} for c in cats])
 
 # --- Product management ---
@@ -337,19 +337,55 @@ def set_discount(product_id):
     db.session.commit()
     return jsonify({"msg": "İndirim uygulandı", "discount_percent": p.discount_percent})
 
+# --- Search / List products with filters, pagination, sorting ---
 @app.route("/products", methods=["GET"])
 def list_products():
-    category = request.args.get("category")
-    q = Product.query
-    if category:
-        cat = Category.query.filter_by(name=category).first()
+    q_text = request.args.get("q", type=str)
+    category_name = request.args.get("category", type=str)
+    category_id = request.args.get("category_id", type=int)
+    min_price = request.args.get("min_price", type=float)
+    max_price = request.args.get("max_price", type=float)
+    sort_by = request.args.get("sort_by", type=str)
+    page = request.args.get("page", default=1, type=int)
+    per_page = request.args.get("per_page", default=20, type=int)
+    if per_page > 100:
+        per_page = 100
+
+    q = Product.query.outerjoin(Category)
+
+    if q_text:
+        like_expr = f"%{q_text}%"
+        q = q.filter(or_(Product.title.ilike(like_expr), Product.description.ilike(like_expr)))
+
+    if category_id:
+        q = q.filter(Product.category_id == category_id)
+    elif category_name:
+        cat = Category.query.filter(func.lower(Category.name) == category_name.lower()).first()
         if cat:
-            q = q.filter_by(category_id=cat.id)
+            q = q.filter(Product.category_id == cat.id)
         else:
-            q = q.filter_by(category_id=None)
-    products = q.all()
+            return jsonify({"total": 0, "page": page, "per_page": per_page, "total_pages": 0, "products": []})
+
+    if min_price is not None:
+        q = q.filter(Product.price >= min_price)
+    if max_price is not None:
+        q = q.filter(Product.price <= max_price)
+
+    if sort_by == "price_asc":
+        q = q.order_by(Product.price.asc())
+    elif sort_by == "price_desc":
+        q = q.order_by(Product.price.desc())
+    elif sort_by == "newest":
+        q = q.order_by(Product.created_at.desc())
+    else:
+        q = q.order_by(Product.id.asc())
+
+    total = q.count()
+    total_pages = (total + per_page - 1) // per_page if per_page else 1
+    items = q.offset((page - 1) * per_page).limit(per_page).all()
+
     out = []
-    for p in products:
+    for p in items:
         out.append({
             "id": p.id,
             "title": p.title,
@@ -361,7 +397,14 @@ def list_products():
             "category": p.category.name if p.category else None,
             "discount_percent": p.discount_percent
         })
-    return jsonify(out)
+
+    return jsonify({
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+        "products": out
+    })
 
 # --- Cart endpoints ---
 @app.route("/cart", methods=["GET"])
@@ -415,9 +458,6 @@ def remove_cart_item():
 @app.route("/cart/checkout", methods=["POST"])
 @jwt_required()
 def checkout():
-    """
-    Checkout: JSON olarak {"payment_method":"kapida_kart" veya "kapida_nakit"} (default kapida_nakit)
-    """
     data = request.json or {}
     payment_method = data.get("payment_method", "kapida_nakit")
     if payment_method in ("card_on_delivery", "kapida_kart"):
@@ -446,7 +486,6 @@ def checkout():
         db.session.delete(it)
     db.session.commit()
 
-    # notify admins
     admins = User.query.filter_by(role="admin").all()
     for admin in admins:
         tokens = [dt.token for dt in admin.device_tokens]
@@ -455,7 +494,7 @@ def checkout():
             title = "Yeni Sipariş"
             body = f"#{order.id} numaralı sipariş oluşturuldu. Tutar: {order.total_amount} TL. Ödeme: {order.payment_method}"
             send_fcm_notification(server_key_to_use, tokens, title, body, data={"order_id": order.id})
-    return jsonify({"msg": "Sipariş oluşturuldu", "order_id": order.id, "payment_method": order.payment_method})
+    return jsonify({"msg": "Sipariş oluştu", "order_id": order.id, "payment_method": order.payment_method})
 
 # --- Admin view orders ---
 @app.route("/admin/orders", methods=["GET"])
@@ -512,7 +551,7 @@ def admin_summary():
     total_products = Product.query.count()
     total_orders = Order.query.count()
     total_users = User.query.filter_by(role="user").count()
-    total_income = db.session.query(db.func.sum(Order.total_amount)).scalar() or 0.0
+    total_income = db.session.query(func.sum(Order.total_amount)).scalar() or 0.0
     return jsonify({
         "total_products": total_products,
         "total_orders": total_orders,
@@ -541,24 +580,17 @@ def get_me():
 @app.route("/me", methods=["PUT"])
 @jwt_required()
 def update_me():
-    """
-    JSON alanları (opsiyonel): name, surname, email, phone, address, username,
-    şifre değişimi için: {"current_password": "...", "new_password": "..."}
-    Eğer username değişirse yeni token döndürülür: {"new_token": "..."}
-    """
     data = request.json or {}
     current_identity = get_jwt_identity()
     user = User.query.filter_by(username=current_identity).first_or_404()
 
     original_username = user.username
 
-    # username uniqueness check
     if "username" in data and data["username"] and data["username"] != user.username:
         if User.query.filter_by(username=data["username"]).first():
             return jsonify({"msg": "Bu kullanıcı adı zaten alınmış"}), 400
         user.username = data["username"]
 
-    # email uniqueness check (optional)
     if "email" in data and data["email"] and data["email"] != user.email:
         if User.query.filter(User.email == data["email"], User.id != user.id).first():
             return jsonify({"msg": "Bu e-posta başka bir hesapta kullanılıyor"}), 400
@@ -568,7 +600,6 @@ def update_me():
         if field in data:
             setattr(user, field, data[field])
 
-    # password change
     if "new_password" in data:
         if "current_password" not in data or not user.check_password(data["current_password"]):
             return jsonify({"msg": "Mevcut şifre yanlış veya sağlanmadı"}), 400
@@ -585,7 +616,6 @@ def update_me():
         "phone": user.phone,
         "address": user.address
     }}
-    # if username changed, return new token
     if original_username != user.username:
         expires = timedelta(days=7)
         new_token = create_access_token(identity=user.username, expires_delta=expires)
@@ -597,5 +627,4 @@ def update_me():
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
-    # port changed to 8000 as you requested
     app.run(host="0.0.0.0", port=8000, debug=True)
