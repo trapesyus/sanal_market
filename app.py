@@ -1,12 +1,13 @@
 # app.py
 import os
 import uuid
+import base64
 import requests
 import importlib.util
 from functools import wraps
 from datetime import datetime, timedelta
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -27,14 +28,11 @@ except Exception:
 
 # ---------- Config ----------
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(BASE_DIR, "app.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "change-this-secret")
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
@@ -77,7 +75,9 @@ class Product(db.Model):
     description = db.Column(db.Text)
     price = db.Column(db.Float, nullable=False)
     stock = db.Column(db.Integer, default=0)
-    image_filename = db.Column(db.String(256), nullable=True)
+    # store base64 image and optional mime type
+    image_base64 = db.Column(db.Text, nullable=True)
+    image_mime = db.Column(db.String(80), nullable=True)
     category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
     discount_percent = db.Column(db.Float, default=0.0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -127,10 +127,6 @@ def admin_required(fn):
     return wrapper
 
 def send_fcm_notification(server_key, tokens, title, body, data=None):
-    """
-    server_key: FCM server key string (legacy). If None, function returns error.
-    tokens: list of device tokens
-    """
     if not tokens:
         return {"success": False, "error": "Recipient token yok"}
     sk = server_key or GLOBAL_FCM_SERVER_KEY
@@ -152,12 +148,29 @@ def send_fcm_notification(server_key, tokens, title, body, data=None):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-def save_image_file(file_storage):
-    ext = os.path.splitext(file_storage.filename)[1]
-    filename = f"{uuid.uuid4().hex}{ext}"
-    path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-    file_storage.save(path)
-    return filename
+def _file_storage_to_base64(file_storage):
+    """
+    Read a Werkzeug FileStorage, return (base64_str, mime_type)
+    """
+    data = file_storage.read()
+    # reset stream pointer (just in case)
+    try:
+        file_storage.stream.seek(0)
+    except Exception:
+        pass
+    b64 = base64.b64encode(data).decode("utf-8")
+    # try to guess mime from filename extension
+    filename = getattr(file_storage, "filename", "") or ""
+    mime = None
+    if "." in filename:
+        ext = filename.rsplit(".", 1)[1].lower()
+        if ext in ("jpg", "jpeg"):
+            mime = "image/jpeg"
+        elif ext == "png":
+            mime = "image/png"
+        elif ext == "gif":
+            mime = "image/gif"
+    return b64, mime
 
 # ---------- Routes ----------
 @app.route("/health")
@@ -255,63 +268,137 @@ def list_categories():
     cats = Category.query.order_by(Category.name.asc()).all()
     return jsonify([{"id": c.id, "name": c.name} for c in cats])
 
+@app.route("/admin/categories/<int:category_id>", methods=["DELETE"])
+@admin_required
+def delete_category(category_id):
+    """
+    DELETE /admin/categories/<id>?force=true
+    - Eğer kategori altında ürün varsa, force parametresi yoksa silmez.
+    - ?force=true ile çağrıldığında ürünlerin category_id = NULL yapılır ve kategori silinir.
+    """
+    cat = Category.query.get_or_404(category_id)
+    related_count = Product.query.filter_by(category_id=cat.id).count()
+    force = request.args.get("force", "false").lower() in ("1", "true", "yes")
+
+    if related_count > 0 and not force:
+        return jsonify({
+            "msg": "Bu kategoride ürün(ler) mevcut. Kategori silinemez.",
+            "category_id": cat.id,
+            "products_count": related_count,
+            "hint": "Eğer tüm ürünlerin kategorisini kaldırmak istiyorsan ?force=true ekleyerek talep gönder."
+        }), 400
+
+    if related_count > 0 and force:
+        Product.query.filter_by(category_id=cat.id).update({"category_id": None})
+        db.session.commit()
+
+    db.session.delete(cat)
+    db.session.commit()
+    return jsonify({"msg": "Kategori silindi", "category_id": category_id})
+
 # --- Product management ---
 @app.route("/admin/products", methods=["POST"])
 @admin_required
 def create_product():
-    title = request.form.get("title")
-    price = request.form.get("price")
-    stock = request.form.get("stock", 0)
-    description = request.form.get("description", "")
-    category_id = request.form.get("category_id")
-    if not title or not price:
+    """
+    Accepts either multipart/form-data (title, price, stock, description, category_id, image file)
+    OR JSON (title, price, stock, description, category_id, image_base64, image_mime(optional))
+    """
+    # Try JSON first
+    if request.is_json:
+        data = request.get_json()
+        title = data.get("title")
+        price = data.get("price")
+        stock = data.get("stock", 0)
+        description = data.get("description", "")
+        category_id = data.get("category_id")
+        image_base64 = data.get("image_base64")
+        image_mime = data.get("image_mime")
+    else:
+        # form (multipart)
+        title = request.form.get("title")
+        price = request.form.get("price")
+        stock = request.form.get("stock", 0)
+        description = request.form.get("description", "")
+        category_id = request.form.get("category_id")
+        image_base64 = None
+        image_mime = None
+        if "image" in request.files:
+            file = request.files["image"]
+            image_base64, image_mime = _file_storage_to_base64(file)
+
+    if not title or price is None:
         return jsonify({"msg": "title ve price gerekli"}), 400
     try:
         price = float(price)
         stock = int(stock)
-    except:
+    except Exception:
         return jsonify({"msg": "price/stock format hatası"}), 400
+
     p = Product(title=title, price=price, stock=stock, description=description)
     if category_id:
         try:
             p.category_id = int(category_id)
-        except:
+        except Exception:
             pass
-    if "image" in request.files:
-        file = request.files["image"]
-        filename = save_image_file(file)
-        p.image_filename = filename
+    if image_base64:
+        p.image_base64 = image_base64
+        p.image_mime = image_mime
     db.session.add(p)
     db.session.commit()
     return jsonify({"msg": "Ürün oluşturuldu", "product_id": p.id})
 
-@app.route("/uploads/<path:filename>")
-def uploads(filename):
-    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
-
 @app.route("/admin/products/<int:product_id>", methods=["PUT"])
 @admin_required
 def update_product(product_id):
+    """
+    Accepts JSON or multipart/form-data. For image:
+      - JSON: image_base64 (and optional image_mime)
+      - multipart: image file (will be converted to base64)
+    """
     p = Product.query.get_or_404(product_id)
-    data = request.form or {}
-    if "title" in data: p.title = data["title"]
-    if "price" in data:
-        try: p.price = float(data["price"])
-        except: pass
-    if "stock" in data:
-        try: p.stock = int(data["stock"])
-        except: pass
-    if "description" in data: p.description = data["description"]
-    if "category_id" in data:
-        try: p.category_id = int(data["category_id"])
-        except: pass
-    if "discount_percent" in data:
-        try: p.discount_percent = float(data["discount_percent"])
-        except: p.discount_percent = 0.0
-    if "image" in request.files:
-        file = request.files["image"]
-        filename = save_image_file(file)
-        p.image_filename = filename
+
+    if request.is_json:
+        data = request.get_json()
+        if "title" in data: p.title = data.get("title")
+        if "price" in data:
+            try: p.price = float(data.get("price"))
+            except: pass
+        if "stock" in data:
+            try: p.stock = int(data.get("stock"))
+            except: pass
+        if "description" in data: p.description = data.get("description")
+        if "category_id" in data:
+            try: p.category_id = int(data.get("category_id"))
+            except: pass
+        if "discount_percent" in data:
+            try: p.discount_percent = float(data.get("discount_percent"))
+            except: p.discount_percent = 0.0
+        if "image_base64" in data:
+            p.image_base64 = data.get("image_base64")
+            p.image_mime = data.get("image_mime")
+    else:
+        data = request.form or {}
+        if "title" in data: p.title = data["title"]
+        if "price" in data:
+            try: p.price = float(data["price"])
+            except: pass
+        if "stock" in data:
+            try: p.stock = int(data["stock"])
+            except: pass
+        if "description" in data: p.description = data["description"]
+        if "category_id" in data:
+            try: p.category_id = int(data["category_id"])
+            except: pass
+        if "discount_percent" in data:
+            try: p.discount_percent = float(data["discount_percent"])
+            except: p.discount_percent = 0.0
+        if "image" in request.files:
+            file = request.files["image"]
+            b64, mime = _file_storage_to_base64(file)
+            p.image_base64 = b64
+            p.image_mime = mime
+
     db.session.commit()
     return jsonify({"msg": "Ürün güncellendi"})
 
@@ -393,7 +480,8 @@ def list_products():
             "price": p.price,
             "price_after_discount": p.price_after_discount,
             "stock": p.stock,
-            "image_url": (request.host_url.rstrip("/") + "/uploads/" + p.image_filename) if p.image_filename else None,
+            "image_base64": p.image_base64,           # base64 returned here
+            "image_mime": p.image_mime,               # optional mime type
             "category": p.category.name if p.category else None,
             "discount_percent": p.discount_percent
         })
@@ -417,7 +505,13 @@ def get_cart():
     for it in items:
         out.append({
             "id": it.id,
-            "product": {"id": it.product.id, "title": it.product.title, "price": it.product.price_after_discount},
+            "product": {
+                "id": it.product.id,
+                "title": it.product.title,
+                "price": it.product.price_after_discount,
+                "image_base64": it.product.image_base64,
+                "image_mime": it.product.image_mime
+            },
             "quantity": it.quantity
         })
     return jsonify(out)
