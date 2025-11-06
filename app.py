@@ -14,7 +14,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
-from sqlalchemy import or_, func
+from sqlalchemy import or_, func, cast, Float
 
 # ---------- Optional external FCM config import ----------
 GLOBAL_FCM_SERVER_KEY = None
@@ -73,21 +73,37 @@ class Product(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text)
-    price = db.Column(db.Float, nullable=False)
+    # price and discount stored as strings
+    price = db.Column(db.String(64), nullable=False)
     stock = db.Column(db.Integer, default=0)
-    # store base64 image and optional mime type
     image_base64 = db.Column(db.Text, nullable=True)
     image_mime = db.Column(db.String(80), nullable=True)
     category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
-    discount_percent = db.Column(db.Float, default=0.0)
+    discount_percent = db.Column(db.String(64), default="0")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     category = db.relationship("Category")
 
+    def _price_float(self):
+        try:
+            return float(self.price.replace(",", ".")) if isinstance(self.price, str) else float(self.price)
+        except Exception:
+            return 0.0
+
+    def _discount_float(self):
+        try:
+            return float(self.discount_percent.replace(",", ".")) if isinstance(self.discount_percent, str) else float(self.discount_percent)
+        except Exception:
+            return 0.0
+
     @property
     def price_after_discount(self):
-        if self.discount_percent and self.discount_percent > 0:
-            return round(self.price * (1 - self.discount_percent / 100), 2)
-        return self.price
+        p = self._price_float()
+        d = self._discount_float()
+        if d and d > 0:
+            val = round(p * (1 - d / 100), 2)
+        else:
+            val = round(p, 2)
+        return f"{val:.2f}"
 
 class CartItem(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -100,9 +116,9 @@ class CartItem(db.Model):
 class Order(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    total_amount = db.Column(db.Float, nullable=False)
-    status = db.Column(db.String(50), default="new")  # new, processing, shipped, completed
-    payment_method = db.Column(db.String(50), default="kapida_nakit")  # kapida_kart or kapida_nakit
+    total_amount = db.Column(db.String(64), nullable=False)
+    status = db.Column(db.String(50), default="new")
+    payment_method = db.Column(db.String(50), default="kapida_nakit")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     items = db.relationship("OrderItem", backref="order", lazy=True)
 
@@ -111,7 +127,7 @@ class OrderItem(db.Model):
     order_id = db.Column(db.Integer, db.ForeignKey("order.id"), nullable=False)
     product_id = db.Column(db.Integer, db.ForeignKey("product.id"), nullable=False)
     quantity = db.Column(db.Integer, nullable=False)
-    unit_price = db.Column(db.Float, nullable=False)
+    unit_price = db.Column(db.String(64), nullable=False)
     product = db.relationship("Product")
 
 # ---------- Helpers ----------
@@ -127,14 +143,17 @@ def admin_required(fn):
     return wrapper
 
 def send_fcm_notification(server_key, tokens, title, body, data=None):
+    """
+    server_key: FCM legacy server key
+    tokens: list of device tokens
+    """
     if not tokens:
         return {"success": False, "error": "Recipient token yok"}
-    sk = server_key or GLOBAL_FCM_SERVER_KEY
-    if not sk:
-        return {"success": False, "error": "FCM server key yok (hem admin hem global)"}
+    if not server_key:
+        return {"success": False, "error": "FCM server key yok"}
     url = "https://fcm.googleapis.com/fcm/send"
     headers = {
-        "Authorization": "key=" + sk,
+        "Authorization": "key=" + server_key,
         "Content-Type": "application/json",
     }
     payload = {
@@ -143,23 +162,23 @@ def send_fcm_notification(server_key, tokens, title, body, data=None):
         "data": data or {}
     }
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=8)
-        return {"success": True, "status_code": r.status_code, "response": r.json()}
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        # try parse json safely
+        try:
+            resp_json = r.json()
+        except Exception:
+            resp_json = r.text
+        return {"success": True, "status_code": r.status_code, "response": resp_json}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 def _file_storage_to_base64(file_storage):
-    """
-    Read a Werkzeug FileStorage, return (base64_str, mime_type)
-    """
     data = file_storage.read()
-    # reset stream pointer (just in case)
     try:
         file_storage.stream.seek(0)
     except Exception:
         pass
     b64 = base64.b64encode(data).decode("utf-8")
-    # try to guess mime from filename extension
     filename = getattr(file_storage, "filename", "") or ""
     mime = None
     if "." in filename:
@@ -171,6 +190,58 @@ def _file_storage_to_base64(file_storage):
         elif ext == "gif":
             mime = "image/gif"
     return b64, mime
+
+def _is_numeric_string(s):
+    try:
+        float(str(s).replace(",", "."))
+        return True
+    except Exception:
+        return False
+
+def notify_users_about_discount(product: Product, triggered_by_admin_username: str = None):
+    """
+    Send FCM notifications to all users about a discount on `product`.
+    Strategy:
+      - collect all user device tokens
+      - if GLOBAL_FCM_SERVER_KEY exists -> use it for single send
+      - else, send per-admin if admin.fcm_server_key present (iterate admins)
+    Returns summary dict.
+    """
+    title = f"{product.title} için {product.discount_percent}% indirim!"
+    body = f"{product.title} ürününde {product.discount_percent}% indirim başladı. Yeni fiyat: {product.price_after_discount} TL"
+
+    users = User.query.filter_by(role="user").all()
+    tokens = [dt.token for u in users for dt in u.device_tokens]
+
+    result = {"total_user_tokens": len(tokens), "fcm_sends": []}
+
+    if not tokens:
+        result["note"] = "Kayıtlı device token yok"
+        return result
+
+    # Prefer global key
+    if GLOBAL_FCM_SERVER_KEY:
+        res = send_fcm_notification(GLOBAL_FCM_SERVER_KEY, tokens, title, body, data={"product_id": product.id})
+        result["fcm_sends"].append({"key": "GLOBAL", "result": res})
+        return result
+
+    # If no global key, try all admins' keys (avoid duplicates)
+    admin_keys = set()
+    admins = User.query.filter_by(role="admin").all()
+    for admin in admins:
+        if admin.fcm_server_key:
+            admin_keys.add(admin.fcm_server_key)
+
+    if not admin_keys:
+        result["note"] = "FCM server key bulunamadı (global yok, adminlerin keyleri yok)"
+        return result
+
+    # send per key
+    for key in admin_keys:
+        res = send_fcm_notification(key, tokens, title, body, data={"product_id": product.id})
+        result["fcm_sends"].append({"key_hash": key[:12] + "...", "result": res})
+
+    return result
 
 # ---------- Routes ----------
 @app.route("/health")
@@ -271,11 +342,6 @@ def list_categories():
 @app.route("/admin/categories/<int:category_id>", methods=["DELETE"])
 @admin_required
 def delete_category(category_id):
-    """
-    DELETE /admin/categories/<id>?force=true
-    - Eğer kategori altında ürün varsa, force parametresi yoksa silmez.
-    - ?force=true ile çağrıldığında ürünlerin category_id = NULL yapılır ve kategori silinir.
-    """
     cat = Category.query.get_or_404(category_id)
     related_count = Product.query.filter_by(category_id=cat.id).count()
     force = request.args.get("force", "false").lower() in ("1", "true", "yes")
@@ -301,41 +367,54 @@ def delete_category(category_id):
 @admin_required
 def create_product():
     """
-    Accepts either multipart/form-data (title, price, stock, description, category_id, image file)
-    OR JSON (title, price, stock, description, category_id, image_base64, image_mime(optional))
+    Accepts JSON or multipart/form-data.
+    price and discount_percent are expected as strings.
     """
-    # Try JSON first
     if request.is_json:
         data = request.get_json()
         title = data.get("title")
-        price = data.get("price")
+        price_str = data.get("price")
         stock = data.get("stock", 0)
         description = data.get("description", "")
         category_id = data.get("category_id")
         image_base64 = data.get("image_base64")
         image_mime = data.get("image_mime")
+        discount_percent_str = data.get("discount_percent", "0")
     else:
-        # form (multipart)
         title = request.form.get("title")
-        price = request.form.get("price")
+        price_str = request.form.get("price")
         stock = request.form.get("stock", 0)
         description = request.form.get("description", "")
         category_id = request.form.get("category_id")
         image_base64 = None
         image_mime = None
+        discount_percent_str = request.form.get("discount_percent", "0")
         if "image" in request.files:
             file = request.files["image"]
             image_base64, image_mime = _file_storage_to_base64(file)
 
-    if not title or price is None:
+    if not title or price_str is None:
         return jsonify({"msg": "title ve price gerekli"}), 400
+
+    if not _is_numeric_string(price_str):
+        return jsonify({"msg": "price numeric string formatında olmalı (örn. '4999' veya '4999.00')"}), 400
+    if discount_percent_str is None:
+        discount_percent_str = "0"
+    if not _is_numeric_string(discount_percent_str):
+        return jsonify({"msg": "discount_percent numeric string formatında olmalı (örn. '5' veya '5.0')"}), 400
+
     try:
-        price = float(price)
         stock = int(stock)
     except Exception:
-        return jsonify({"msg": "price/stock format hatası"}), 400
+        return jsonify({"msg": "stock integer formatında olmalı"}), 400
 
-    p = Product(title=title, price=price, stock=stock, description=description)
+    p = Product(
+        title=title,
+        price=str(price_str),
+        stock=stock,
+        description=description,
+        discount_percent=str(discount_percent_str)
+    )
     if category_id:
         try:
             p.category_id = int(category_id)
@@ -346,34 +425,45 @@ def create_product():
         p.image_mime = image_mime
     db.session.add(p)
     db.session.commit()
+
+    # If initial discount > 0, notify users (FCM only)
+    try:
+        if float(p.discount_percent.replace(",", ".")) > 0:
+            current = get_jwt_identity()
+            notify_users_about_discount(p, triggered_by_admin_username=current)
+    except Exception:
+        pass
+
     return jsonify({"msg": "Ürün oluşturuldu", "product_id": p.id})
 
 @app.route("/admin/products/<int:product_id>", methods=["PUT"])
 @admin_required
 def update_product(product_id):
-    """
-    Accepts JSON or multipart/form-data. For image:
-      - JSON: image_base64 (and optional image_mime)
-      - multipart: image file (will be converted to base64)
-    """
     p = Product.query.get_or_404(product_id)
+    old_discount = str(p.discount_percent)
 
     if request.is_json:
         data = request.get_json()
         if "title" in data: p.title = data.get("title")
         if "price" in data:
-            try: p.price = float(data.get("price"))
-            except: pass
+            price_str = data.get("price")
+            if price_str is not None:
+                if not _is_numeric_string(price_str):
+                    return jsonify({"msg": "price numeric string formatında olmalı"}), 400
+                p.price = str(price_str)
         if "stock" in data:
             try: p.stock = int(data.get("stock"))
-            except: pass
+            except: return jsonify({"msg": "stock integer formatında olmalı"}), 400
         if "description" in data: p.description = data.get("description")
         if "category_id" in data:
             try: p.category_id = int(data.get("category_id"))
             except: pass
         if "discount_percent" in data:
-            try: p.discount_percent = float(data.get("discount_percent"))
-            except: p.discount_percent = 0.0
+            dp = data.get("discount_percent")
+            if dp is not None:
+                if not _is_numeric_string(dp):
+                    return jsonify({"msg": "discount_percent numeric string formatında olmalı"}), 400
+                p.discount_percent = str(dp)
         if "image_base64" in data:
             p.image_base64 = data.get("image_base64")
             p.image_mime = data.get("image_mime")
@@ -381,18 +471,22 @@ def update_product(product_id):
         data = request.form or {}
         if "title" in data: p.title = data["title"]
         if "price" in data:
-            try: p.price = float(data["price"])
-            except: pass
+            price_str = data["price"]
+            if not _is_numeric_string(price_str):
+                return jsonify({"msg": "price numeric string formatında olmalı"}), 400
+            p.price = str(price_str)
         if "stock" in data:
             try: p.stock = int(data["stock"])
-            except: pass
+            except: return jsonify({"msg": "stock integer formatında olmalı"}), 400
         if "description" in data: p.description = data["description"]
         if "category_id" in data:
             try: p.category_id = int(data["category_id"])
             except: pass
         if "discount_percent" in data:
-            try: p.discount_percent = float(data["discount_percent"])
-            except: p.discount_percent = 0.0
+            dp = data["discount_percent"]
+            if not _is_numeric_string(dp):
+                return jsonify({"msg": "discount_percent numeric string formatında olmalı"}), 400
+            p.discount_percent = str(dp)
         if "image" in request.files:
             file = request.files["image"]
             b64, mime = _file_storage_to_base64(file)
@@ -400,6 +494,16 @@ def update_product(product_id):
             p.image_mime = mime
 
     db.session.commit()
+
+    # If discount changed and >0, notify users (FCM only)
+    try:
+        if old_discount != str(p.discount_percent):
+            if float(str(p.discount_percent).replace(",", ".")) > 0:
+                current = get_jwt_identity()
+                notify_users_about_discount(p, triggered_by_admin_username=current)
+    except Exception:
+        pass
+
     return jsonify({"msg": "Ürün güncellendi"})
 
 @app.route("/admin/products/<int:product_id>", methods=["DELETE"])
@@ -417,21 +521,25 @@ def set_discount(product_id):
     data = request.json or {}
     if "discount_percent" not in data:
         return jsonify({"msg": "discount_percent gerekli"}), 400
-    try:
-        p.discount_percent = float(data["discount_percent"])
-    except:
-        return jsonify({"msg": "discount_percent format hatası"}), 400
+    dp = data.get("discount_percent")
+    if dp is None or not _is_numeric_string(dp):
+        return jsonify({"msg": "discount_percent numeric string formatında olmalı"}), 400
+    p.discount_percent = str(dp)
     db.session.commit()
-    return jsonify({"msg": "İndirim uygulandı", "discount_percent": p.discount_percent})
 
-# --- Search / List products with filters, pagination, sorting ---
+    # Notify users about discount (FCM only)
+    current = get_jwt_identity()
+    notify_result = notify_users_about_discount(p, triggered_by_admin_username=current)
+    return jsonify({"msg": "İndirim uygulandı", "discount_percent": p.discount_percent, "notify_result": notify_result})
+
+# --- Search / List products ---
 @app.route("/products", methods=["GET"])
 def list_products():
     q_text = request.args.get("q", type=str)
     category_name = request.args.get("category", type=str)
     category_id = request.args.get("category_id", type=int)
-    min_price = request.args.get("min_price", type=float)
-    max_price = request.args.get("max_price", type=float)
+    min_price = request.args.get("min_price", type=str)
+    max_price = request.args.get("max_price", type=str)
     sort_by = request.args.get("sort_by", type=str)
     page = request.args.get("page", default=1, type=int)
     per_page = request.args.get("per_page", default=20, type=int)
@@ -453,15 +561,15 @@ def list_products():
         else:
             return jsonify({"total": 0, "page": page, "per_page": per_page, "total_pages": 0, "products": []})
 
-    if min_price is not None:
-        q = q.filter(Product.price >= min_price)
-    if max_price is not None:
-        q = q.filter(Product.price <= max_price)
+    if min_price is not None and _is_numeric_string(min_price):
+        q = q.filter(cast(Product.price, Float) >= float(min_price.replace(",", ".")))
+    if max_price is not None and _is_numeric_string(max_price):
+        q = q.filter(cast(Product.price, Float) <= float(max_price.replace(",", ".")))
 
     if sort_by == "price_asc":
-        q = q.order_by(Product.price.asc())
+        q = q.order_by(cast(Product.price, Float).asc())
     elif sort_by == "price_desc":
-        q = q.order_by(Product.price.desc())
+        q = q.order_by(cast(Product.price, Float).desc())
     elif sort_by == "newest":
         q = q.order_by(Product.created_at.desc())
     else:
@@ -477,13 +585,13 @@ def list_products():
             "id": p.id,
             "title": p.title,
             "description": p.description,
-            "price": p.price,
+            "price": str(p.price),
             "price_after_discount": p.price_after_discount,
             "stock": p.stock,
-            "image_base64": p.image_base64,           # base64 returned here
-            "image_mime": p.image_mime,               # optional mime type
+            "image_base64": p.image_base64,
+            "image_mime": p.image_mime,
             "category": p.category.name if p.category else None,
-            "discount_percent": p.discount_percent
+            "discount_percent": str(p.discount_percent)
         })
 
     return jsonify({
@@ -508,7 +616,8 @@ def get_cart():
             "product": {
                 "id": it.product.id,
                 "title": it.product.title,
-                "price": it.product.price_after_discount,
+                "price": str(it.product.price),
+                "price_after_discount": it.product.price_after_discount,
                 "image_base64": it.product.image_base64,
                 "image_mime": it.product.image_mime
             },
@@ -525,7 +634,10 @@ def add_to_cart():
     current = get_jwt_identity()
     user = User.query.filter_by(username=current).first()
     product = Product.query.get_or_404(data["product_id"])
-    qty = int(data["quantity"])
+    try:
+        qty = int(data["quantity"])
+    except Exception:
+        return jsonify({"msg": "quantity integer olmalı"}), 400
     if product.stock < qty:
         return jsonify({"msg": "Yeterli stok yok"}), 400
     item = CartItem.query.filter_by(user_id=user.id, product_id=product.id).first()
@@ -548,7 +660,6 @@ def remove_cart_item():
     db.session.commit()
     return jsonify({"msg": "Silindi"})
 
-# --- Checkout / create order ---
 @app.route("/cart/checkout", methods=["POST"])
 @jwt_required()
 def checkout():
@@ -568,13 +679,19 @@ def checkout():
     for it in items:
         if it.product.stock < it.quantity:
             return jsonify({"msg": f"{it.product.title} için yeterli stok yok"}), 400
-        total += it.product.price_after_discount * it.quantity
+        try:
+            unit = float(it.product.price_after_discount.replace(",", "."))
+        except Exception:
+            unit = 0.0
+        total += unit * it.quantity
 
-    order = Order(user_id=user.id, total_amount=round(total,2), payment_method=payment_method)
+    total_rounded = round(total, 2)
+    order = Order(user_id=user.id, total_amount=f"{total_rounded:.2f}", payment_method=payment_method)
     db.session.add(order)
     db.session.commit()
     for it in items:
-        oi = OrderItem(order_id=order.id, product_id=it.product.id, quantity=it.quantity, unit_price=it.product.price_after_discount)
+        unit_price_str = it.product.price_after_discount
+        oi = OrderItem(order_id=order.id, product_id=it.product.id, quantity=it.quantity, unit_price=str(unit_price_str))
         db.session.add(oi)
         it.product.stock -= it.quantity
         db.session.delete(it)
@@ -588,9 +705,9 @@ def checkout():
             title = "Yeni Sipariş"
             body = f"#{order.id} numaralı sipariş oluşturuldu. Tutar: {order.total_amount} TL. Ödeme: {order.payment_method}"
             send_fcm_notification(server_key_to_use, tokens, title, body, data={"order_id": order.id})
-    return jsonify({"msg": "Sipariş oluştu", "order_id": order.id, "payment_method": order.payment_method})
+    return jsonify({"msg": "Sipariş oluştu", "order_id": order.id, "payment_method": order.payment_method, "total_amount": order.total_amount})
 
-# --- Admin view orders ---
+# --- Admin endpoints: orders / announce / fcm key / summary ---
 @app.route("/admin/orders", methods=["GET"])
 @admin_required
 def admin_orders():
@@ -600,15 +717,14 @@ def admin_orders():
         out.append({
             "id": o.id,
             "user_id": o.user_id,
-            "total_amount": o.total_amount,
+            "total_amount": str(o.total_amount),
             "status": o.status,
             "payment_method": o.payment_method,
             "created_at": o.created_at.isoformat(),
-            "items": [{"product_id": it.product_id, "title": it.product.title, "quantity": it.quantity, "unit_price": it.unit_price} for it in o.items]
+            "items": [{"product_id": it.product_id, "title": it.product.title, "quantity": it.quantity, "unit_price": str(it.unit_price)} for it in o.items]
         })
     return jsonify(out)
 
-# --- Admin announcement via their FCM key (or global fallback) ---
 @app.route("/admin/announce", methods=["POST"])
 @admin_required
 def admin_announce():
@@ -621,6 +737,7 @@ def admin_announce():
         tokens = data["tokens"]
     else:
         tokens = [dt.token for u in User.query.filter_by(role="user").all() for dt in u.device_tokens]
+    # prefer admin's key, fallback to global
     server_key_to_use = admin.fcm_server_key or GLOBAL_FCM_SERVER_KEY
     if not server_key_to_use:
         return jsonify({"msg": "Admin için FCM server key tanımlı değil ve global fallback yok"}), 400
@@ -645,15 +762,22 @@ def admin_summary():
     total_products = Product.query.count()
     total_orders = Order.query.count()
     total_users = User.query.filter_by(role="user").count()
-    total_income = db.session.query(func.sum(Order.total_amount)).scalar() or 0.0
+    # total_income: sum Order.total_amount strings
+    total_income_val = 0.0
+    for o in Order.query.all():
+        try:
+            total_income_val += float(str(o.total_amount).replace(",", "."))
+        except Exception:
+            pass
+    total_income_str = f"{round(total_income_val,2):.2f}"
     return jsonify({
         "total_products": total_products,
         "total_orders": total_orders,
         "total_users": total_users,
-        "total_income": float(total_income)
+        "total_income": total_income_str
     })
 
-# --- Kullanıcı kendi profilini görüntüleme / güncelleme ---
+# --- User profile ---
 @app.route("/me", methods=["GET"])
 @jwt_required()
 def get_me():
