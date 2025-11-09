@@ -16,7 +16,7 @@ from flask_jwt_extended import (
 )
 from sqlalchemy import or_, func, cast, Float
 
-# Optional external FCM config import
+# ---------- Optional external FCM config import ----------
 GLOBAL_FCM_SERVER_KEY = None
 try:
     spec = importlib.util.find_spec("fcm_config")
@@ -26,6 +26,7 @@ try:
 except Exception:
     GLOBAL_FCM_SERVER_KEY = None
 
+# ---------- Config ----------
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 
 app = Flask(__name__)
@@ -48,7 +49,7 @@ class User(db.Model):
     phone = db.Column(db.String(50))
     address = db.Column(db.Text, nullable=True)
     role = db.Column(db.String(20), default="user")  # 'user' or 'admin'
-    fcm_server_key = db.Column(db.Text, nullable=True)
+    fcm_server_key = db.Column(db.Text, nullable=True)  # admin can store server key
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     device_tokens = db.relationship("DeviceToken", backref="user", lazy=True)
 
@@ -72,12 +73,13 @@ class Product(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text)
-    price = db.Column(db.String(64), nullable=False)   # stored as string
+    # price and discount stored as strings (as requested)
+    price = db.Column(db.String(64), nullable=False)
     stock = db.Column(db.Integer, default=0)           # stored as integer internally
     image_base64 = db.Column(db.Text, nullable=True)
     image_mime = db.Column(db.String(80), nullable=True)
     category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
-    discount_percent = db.Column(db.String(64), default="0")  # stored as string
+    discount_percent = db.Column(db.String(64), default="0")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     category = db.relationship("Category")
 
@@ -101,6 +103,7 @@ class Product(db.Model):
             val = round(p * (1 - d / 100), 2)
         else:
             val = round(p, 2)
+        # return as string per requirement
         return f"{val:.2f}"
 
 class CartItem(db.Model):
@@ -141,6 +144,10 @@ def admin_required(fn):
     return wrapper
 
 def send_fcm_notification(server_key, tokens, title, body, data=None):
+    """
+    server_key: FCM legacy server key
+    tokens: list of device tokens
+    """
     if not tokens:
         return {"success": False, "error": "Recipient token yok"}
     if not server_key:
@@ -208,29 +215,42 @@ def _parse_stock_value(s):
         raise ValueError("stock integer formatında olmalı (örn. '10')")
 
 def notify_users_about_discount(product: Product, triggered_by_admin_username: str = None):
+    """
+    Send FCM notifications to all users about a discount on `product`.
+    """
     title = f"{product.title} için {product.discount_percent}% indirim!"
     body = f"{product.title} ürününde {product.discount_percent}% indirim başladı. Yeni fiyat: {product.price_after_discount} TL"
+
     users = User.query.filter_by(role="user").all()
     tokens = [dt.token for u in users for dt in u.device_tokens]
+
     result = {"total_user_tokens": len(tokens), "fcm_sends": []}
+
     if not tokens:
         result["note"] = "Kayıtlı device token yok"
         return result
+
+    # Prefer global key
     if GLOBAL_FCM_SERVER_KEY:
         res = send_fcm_notification(GLOBAL_FCM_SERVER_KEY, tokens, title, body, data={"product_id": product.id})
         result["fcm_sends"].append({"key": "GLOBAL", "result": res})
         return result
+
+    # If no global key, try all admins' keys (avoid duplicates)
     admin_keys = set()
     admins = User.query.filter_by(role="admin").all()
     for admin in admins:
         if admin.fcm_server_key:
             admin_keys.add(admin.fcm_server_key)
+
     if not admin_keys:
         result["note"] = "FCM server key bulunamadı (global yok, adminlerin keyleri yok)"
         return result
+
     for key in admin_keys:
         res = send_fcm_notification(key, tokens, title, body, data={"product_id": product.id})
         result["fcm_sends"].append({"key_hash": key[:12] + "...", "result": res})
+
     return result
 
 # ---------- Routes ----------
@@ -238,7 +258,7 @@ def notify_users_about_discount(product: Product, triggered_by_admin_username: s
 def health():
     return jsonify({"status": "ok"})
 
-# Auth endpoints
+# --- Auth ---
 @app.route("/auth/register_admin", methods=["POST"])
 def register_admin():
     data = request.json or {}
@@ -294,9 +314,24 @@ def login():
         return jsonify({"msg": "Kullanıcı adı veya şifre hatalı"}), 401
     expires = timedelta(days=7)
     token = create_access_token(identity=user.username, expires_delta=expires)
-    return jsonify({"access_token": token, "user": {"id": user.id, "username": user.username, "role": user.role}})
 
-# Device token registration
+    # döndürülecek user objesi: kayıt sırasında girilen tüm bilgiler
+    user_info = {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "name": user.name,
+        "surname": user.surname,
+        "phone": user.phone,
+        "address": user.address,
+        "role": user.role,
+        "created_at": user.created_at.isoformat(),
+        "device_tokens": [dt.token for dt in user.device_tokens]
+    }
+
+    return jsonify({"access_token": token, "user": user_info})
+
+# --- Device token registration for FCM ---
 @app.route("/auth/device/register", methods=["POST"])
 @jwt_required()
 def register_device():
@@ -305,12 +340,15 @@ def register_device():
         return jsonify({"msg": "token gerekli"}), 400
     current = get_jwt_identity()
     user = User.query.filter_by(username=current).first()
+    # prevent duplicate tokens
+    if DeviceToken.query.filter_by(token=data["token"], user_id=user.id).first():
+        return jsonify({"msg": "Token zaten kayıtlı"})
     dt = DeviceToken(token=data["token"], user_id=user.id)
     db.session.add(dt)
     db.session.commit()
     return jsonify({"msg": "Device token kaydedildi"})
 
-# Category endpoints
+# --- Category management ---
 @app.route("/admin/categories", methods=["POST"])
 @admin_required
 def create_category():
@@ -335,6 +373,7 @@ def delete_category(category_id):
     cat = Category.query.get_or_404(category_id)
     related_count = Product.query.filter_by(category_id=cat.id).count()
     force = request.args.get("force", "false").lower() in ("1", "true", "yes")
+
     if related_count > 0 and not force:
         return jsonify({
             "msg": "Bu kategoride ürün(ler) mevcut. Kategori silinemez.",
@@ -342,18 +381,19 @@ def delete_category(category_id):
             "products_count": related_count,
             "hint": "Eğer tüm ürünlerin kategorisini kaldırmak istiyorsan ?force=true ekleyerek talep gönder."
         }), 400
+
     if related_count > 0 and force:
         Product.query.filter_by(category_id=cat.id).update({"category_id": None})
         db.session.commit()
+
     db.session.delete(cat)
     db.session.commit()
     return jsonify({"msg": "Kategori silindi", "category_id": category_id})
 
-# Product management
+# --- Product management ---
 @app.route("/admin/products", methods=["POST"])
 @admin_required
 def create_product():
-    # Accept JSON or multipart/form-data
     if request.is_json:
         data = request.get_json()
         title = data.get("title")
@@ -514,11 +554,13 @@ def set_discount(product_id):
         return jsonify({"msg": "discount_percent numeric string formatında olmalı"}), 400
     p.discount_percent = str(dp)
     db.session.commit()
+
+    # Notify users about discount (FCM only)
     current = get_jwt_identity()
     notify_result = notify_users_about_discount(p, triggered_by_admin_username=current)
     return jsonify({"msg": "İndirim uygulandı", "discount_percent": p.discount_percent, "notify_result": notify_result})
 
-# Product listing / filtering
+# --- Search / List products ---
 @app.route("/products", methods=["GET"])
 def list_products():
     q_text = request.args.get("q", type=str)
@@ -588,7 +630,7 @@ def list_products():
         "products": out
     })
 
-# Cart endpoints
+# --- Cart endpoints ---
 @app.route("/cart", methods=["GET"])
 @jwt_required()
 def get_cart():
@@ -647,7 +689,7 @@ def remove_cart_item():
     db.session.commit()
     return jsonify({"msg": "Silindi"})
 
-# Checkout / create order
+# --- Checkout / create order ---
 @app.route("/cart/checkout", methods=["POST"])
 @jwt_required()
 def checkout():
@@ -695,7 +737,7 @@ def checkout():
             send_fcm_notification(server_key_to_use, tokens, title, body, data={"order_id": order.id})
     return jsonify({"msg": "Sipariş oluştu", "order_id": order.id, "payment_method": order.payment_method, "total_amount": order.total_amount})
 
-# Admin: orders / announce / fcm key / summary
+# --- Admin view orders ---
 @app.route("/admin/orders", methods=["GET"])
 @admin_required
 def admin_orders():
@@ -713,6 +755,7 @@ def admin_orders():
         })
     return jsonify(out)
 
+# --- Admin announcement via their FCM key (or global fallback) ---
 @app.route("/admin/announce", methods=["POST"])
 @admin_required
 def admin_announce():
@@ -763,7 +806,7 @@ def admin_summary():
         "total_income": total_income_str
     })
 
-# User profile
+# --- Kullanıcı kendi profilini görüntüleme / güncelleme ---
 @app.route("/me", methods=["GET"])
 @jwt_required()
 def get_me():
@@ -778,7 +821,8 @@ def get_me():
         "phone": user.phone,
         "address": user.address,
         "role": user.role,
-        "created_at": user.created_at.isoformat()
+        "created_at": user.created_at.isoformat(),
+        "device_tokens": [dt.token for dt in user.device_tokens]
     })
 
 @app.route("/me", methods=["PUT"])
@@ -787,23 +831,30 @@ def update_me():
     data = request.json or {}
     current_identity = get_jwt_identity()
     user = User.query.filter_by(username=current_identity).first_or_404()
+
     original_username = user.username
+
     if "username" in data and data["username"] and data["username"] != user.username:
         if User.query.filter_by(username=data["username"]).first():
             return jsonify({"msg": "Bu kullanıcı adı zaten alınmış"}), 400
         user.username = data["username"]
+
     if "email" in data and data["email"] and data["email"] != user.email:
         if User.query.filter(User.email == data["email"], User.id != user.id).first():
             return jsonify({"msg": "Bu e-posta başka bir hesapta kullanılıyor"}), 400
         user.email = data["email"]
+
     for field in ("name", "surname", "phone", "address"):
         if field in data:
             setattr(user, field, data[field])
+
     if "new_password" in data:
         if "current_password" not in data or not user.check_password(data["current_password"]):
             return jsonify({"msg": "Mevcut şifre yanlış veya sağlanmadı"}), 400
         user.set_password(data["new_password"])
+
     db.session.commit()
+
     response = {"msg": "Profil güncellendi", "user": {
         "id": user.id,
         "username": user.username,
@@ -817,9 +868,10 @@ def update_me():
         expires = timedelta(days=7)
         new_token = create_access_token(identity=user.username, expires_delta=expires)
         response["new_token"] = new_token
+
     return jsonify(response)
 
-# Run
+# ---------- Run ----------
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
