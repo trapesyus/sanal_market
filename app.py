@@ -2,12 +2,14 @@
 import os
 import uuid
 import base64
+import json
+import logging
 import requests
 import importlib.util
 from functools import wraps
 from datetime import datetime, timedelta
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -16,27 +18,39 @@ from flask_jwt_extended import (
 )
 from sqlalchemy import or_, func, cast, Float
 
-# ---------- Optional external FCM config import ----------
-GLOBAL_FCM_SERVER_KEY = None
+# Try import firebase_admin (preferred)
 try:
-    spec = importlib.util.find_spec("fcm_config")
-    if spec is not None:
-        fcm_config = importlib.import_module("fcm_config")
-        GLOBAL_FCM_SERVER_KEY = getattr(fcm_config, "FCM_SERVER_KEY", None)
+    import firebase_admin
+    from firebase_admin import credentials, messaging
+    from firebase_admin.exceptions import FirebaseError
+    FIREBASE_AVAILABLE = True
 except Exception:
-    GLOBAL_FCM_SERVER_KEY = None
+    FIREBASE_AVAILABLE = False
 
 # ---------- Config ----------
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(BASE_DIR, "app.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "change-this-secret")
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
 jwt = JWTManager(app)
+
+# ---------- Logging ----------
+if not os.path.exists("logs"):
+    os.makedirs("logs")
+file_handler = logging.FileHandler("logs/app.log")
+file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+file_handler.setLevel(logging.INFO)
+app.logger.setLevel(logging.INFO)
+app.logger.addHandler(file_handler)
+app.logger.addHandler(logging.StreamHandler())
 
 # ---------- Models ----------
 class User(db.Model):
@@ -49,7 +63,7 @@ class User(db.Model):
     phone = db.Column(db.String(50))
     address = db.Column(db.Text, nullable=True)
     role = db.Column(db.String(20), default="user")  # 'user' or 'admin'
-    fcm_server_key = db.Column(db.Text, nullable=True)  # admin can store server key
+    fcm_server_key = db.Column(db.Text, nullable=True)  # legacy HTTP server key (optional)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     device_tokens = db.relationship("DeviceToken", backref="user", lazy=True)
 
@@ -73,13 +87,12 @@ class Product(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text)
-    # price and discount stored as strings (as requested)
-    price = db.Column(db.String(64), nullable=False)
-    stock = db.Column(db.Integer, default=0)           # stored as integer internally
+    price = db.Column(db.String(64), nullable=False)   # string per requirement
+    stock = db.Column(db.Integer, default=0)           # stored as int internally
     image_base64 = db.Column(db.Text, nullable=True)
     image_mime = db.Column(db.String(80), nullable=True)
     category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
-    discount_percent = db.Column(db.String(64), default="0")
+    discount_percent = db.Column(db.String(64), default="0")  # string percent
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     category = db.relationship("Category")
 
@@ -103,7 +116,6 @@ class Product(db.Model):
             val = round(p * (1 - d / 100), 2)
         else:
             val = round(p, 2)
-        # return as string per requirement
         return f"{val:.2f}"
 
 class CartItem(db.Model):
@@ -117,7 +129,7 @@ class CartItem(db.Model):
 class Order(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    total_amount = db.Column(db.String(64), nullable=False)
+    total_amount = db.Column(db.String(64), nullable=False)  # string
     status = db.Column(db.String(50), default="new")
     payment_method = db.Column(db.String(50), default="kapida_nakit")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -142,35 +154,6 @@ def admin_required(fn):
             return jsonify({"msg": "Admin yetkisi gerekli"}), 403
         return fn(*args, **kwargs)
     return wrapper
-
-def send_fcm_notification(server_key, tokens, title, body, data=None):
-    """
-    server_key: FCM legacy server key
-    tokens: list of device tokens
-    """
-    if not tokens:
-        return {"success": False, "error": "Recipient token yok"}
-    if not server_key:
-        return {"success": False, "error": "FCM server key yok"}
-    url = "https://fcm.googleapis.com/fcm/send"
-    headers = {
-        "Authorization": "key=" + server_key,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "registration_ids": tokens,
-        "notification": {"title": title, "body": body},
-        "data": data or {}
-    }
-    try:
-        r = requests.post(url, json=payload, headers=headers, timeout=10)
-        try:
-            resp_json = r.json()
-        except Exception:
-            resp_json = r.text
-        return {"success": True, "status_code": r.status_code, "response": resp_json}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 def _file_storage_to_base64(file_storage):
     data = file_storage.read()
@@ -199,59 +182,165 @@ def _is_numeric_string(s):
         return False
 
 def _parse_stock_value(s):
-    """
-    Accept stock provided as string (e.g. "10" or "10.0" or 10) and
-    return integer value. Raises ValueError on invalid.
-    """
     if s is None or s == "":
         return 0
     if isinstance(s, int):
         return s
     try:
-        # allow "10", "10.0", "10,0"
         val = float(str(s).replace(",", "."))
         return int(val)
     except Exception:
         raise ValueError("stock integer formatında olmalı (örn. '10')")
 
-def notify_users_about_discount(product: Product, triggered_by_admin_username: str = None):
-    """
-    Send FCM notifications to all users about a discount on `product`.
-    """
-    title = f"{product.title} için {product.discount_percent}% indirim!"
-    body = f"{product.title} ürününde {product.discount_percent}% indirim başladı. Yeni fiyat: {product.price_after_discount} TL"
+# ---------- Firebase / FCM Setup ----------
+SERVICE_ACCOUNT_PATH = "/root/perem-sanal.json"  # as requested
+firebase_app = None
 
-    users = User.query.filter_by(role="user").all()
-    tokens = [dt.token for u in users for dt in u.device_tokens]
+if FIREBASE_AVAILABLE:
+    try:
+        if os.path.exists(SERVICE_ACCOUNT_PATH):
+            with open(SERVICE_ACCOUNT_PATH, "r", encoding="utf-8") as f:
+                key_data = json.load(f)
+            # fix newline escape if present
+            if "private_key" in key_data and "\\n" in key_data["private_key"]:
+                key_data["private_key"] = key_data["private_key"].replace("\\n", "\n")
+            required = ["type", "project_id", "private_key_id", "private_key", "client_email"]
+            missing = [r for r in required if r not in key_data]
+            if missing:
+                app.logger.error(f"Service account eksik alanlar: {missing} — Firebase devre dışı")
+                firebase_app = None
+            elif key_data.get("type") != "service_account":
+                app.logger.error(f"Service account tipi beklenmiyor: {key_data.get('type')} — Firebase devre dışı")
+                firebase_app = None
+            else:
+                cred = credentials.Certificate(key_data)
+                firebase_app = firebase_admin.initialize_app(cred)
+                app.logger.info("Firebase Admin SDK başarıyla başlatıldı.")
+        else:
+            app.logger.warning(f"Firebase service account bulunamadı: {SERVICE_ACCOUNT_PATH} — Firebase devre dışı")
+            firebase_app = None
+    except Exception as e:
+        app.logger.exception(f"Firebase init hatası: {e}")
+        firebase_app = None
+else:
+    app.logger.warning("firebase_admin yüklü değil — Firebase FCM devre dışı")
 
-    result = {"total_user_tokens": len(tokens), "fcm_sends": []}
+# helper chunk
+def _chunks(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
+def cleanup_invalid_fcm_token(token):
+    try:
+        dts = DeviceToken.query.filter_by(token=token).all()
+        for dt in dts:
+            db.session.delete(dt)
+        db.session.commit()
+        app.logger.info(f"Geçersiz token temizlendi: {token[:20]}...")
+    except Exception as e:
+        app.logger.exception(f"cleanup_invalid_fcm_token hata: {e}")
+
+def send_fcm_via_firebase(tokens, title, body, data=None):
+    if not firebase_app:
+        return {"success": False, "error": "firebase_app yok"}
     if not tokens:
-        result["note"] = "Kayıtlı device token yok"
-        return result
+        return {"success": False, "error": "no tokens"}
+    data = data or {}
+    summary = {"total_tokens": len(tokens), "success_count": 0, "failure_count": 0, "responses": []}
+    try:
+        for batch in _chunks(tokens, 500):
+            message = messaging.MulticastMessage(
+                tokens=batch,
+                notification=messaging.Notification(title=title, body=body),
+                data={k: str(v) for k, v in (data or {}).items()},
+                android=messaging.AndroidConfig(priority="high",
+                                               notification=messaging.AndroidNotification(sound="default", click_action="FLUTTER_NOTIFICATION_CLICK")),
+                apns=messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound="default", badge=1)))
+            )
+            resp = messaging.send_multicast(message)
+            summary["success_count"] += resp.success_count
+            summary["failure_count"] += resp.failure_count
+            for i, r in enumerate(resp.responses):
+                if r.success:
+                    summary["responses"].append({"index": i, "message_id": r.message_id})
+                else:
+                    err = str(r.exception) if r.exception else "unknown"
+                    summary["responses"].append({"index": i, "error": err})
+                    s = err.lower()
+                    if any(x in s for x in ["unregistered", "not-found", "notregistered", "invalid-argument"]):
+                        try:
+                            cleanup_invalid_fcm_token(batch[i])
+                        except Exception:
+                            pass
+        return {"success": True, "summary": summary}
+    except Exception as e:
+        app.logger.exception(f"send_fcm_via_firebase hata: {e}")
+        return {"success": False, "error": str(e)}
 
-    # Prefer global key
-    if GLOBAL_FCM_SERVER_KEY:
-        res = send_fcm_notification(GLOBAL_FCM_SERVER_KEY, tokens, title, body, data={"product_id": product.id})
-        result["fcm_sends"].append({"key": "GLOBAL", "result": res})
-        return result
+def send_fcm_legacy(server_key, tokens, title, body, data=None):
+    if not server_key:
+        return {"success": False, "error": "no server_key"}
+    if not tokens:
+        return {"success": False, "error": "no tokens"}
+    url = "https://fcm.googleapis.com/fcm/send"
+    headers = {"Authorization": "key=" + server_key, "Content-Type": "application/json"}
+    payload = {"registration_ids": tokens, "notification": {"title": title, "body": body}, "data": data or {}}
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        try:
+            resp_json = r.json()
+        except Exception:
+            resp_json = r.text
+        return {"success": True, "status_code": r.status_code, "response": resp_json}
+    except Exception as e:
+        app.logger.exception(f"send_fcm_legacy hata: {e}")
+        return {"success": False, "error": str(e)}
 
-    # If no global key, try all admins' keys (avoid duplicates)
-    admin_keys = set()
-    admins = User.query.filter_by(role="admin").all()
-    for admin in admins:
-        if admin.fcm_server_key:
-            admin_keys.add(admin.fcm_server_key)
+def send_fcm_notification(tokens, title, body, data=None, fallback_server_keys=None):
+    if not tokens:
+        return {"success": False, "error": "no tokens provided"}
+    # try firebase_admin first
+    if firebase_app:
+        res = send_fcm_via_firebase(tokens, title, body, data or {})
+        if res.get("success"):
+            return res
+    # fallback with provided keys
+    if fallback_server_keys:
+        for sk in fallback_server_keys:
+            if not sk:
+                continue
+            res = send_fcm_legacy(sk, tokens, title, body, data or {})
+            if res.get("success"):
+                return res
+    # try global env key
+    env_key = os.environ.get("GLOBAL_LEGACY_FCM_SERVER_KEY")
+    if env_key:
+        res = send_fcm_legacy(env_key, tokens, title, body, data or {})
+        if res.get("success"):
+            return res
+    return {"success": False, "error": "No working FCM method available"}
 
-    if not admin_keys:
-        result["note"] = "FCM server key bulunamadı (global yok, adminlerin keyleri yok)"
-        return result
-
-    for key in admin_keys:
-        res = send_fcm_notification(key, tokens, title, body, data={"product_id": product.id})
-        result["fcm_sends"].append({"key_hash": key[:12] + "...", "result": res})
-
-    return result
+def validate_fcm_token(fcm_token):
+    if not fcm_token:
+        return False
+    if firebase_app:
+        try:
+            msg = messaging.Message(token=fcm_token, data={"validation": "test"})
+            messaging.send(msg, dry_run=True)
+            return True
+        except FirebaseError as e:
+            s = str(e).lower()
+            if any(x in s for x in ("unregistered", "not-found", "notregistered")):
+                return False
+            if any(x in s for x in ("invalid-argument", "invalid")):
+                return False
+            app.logger.exception(f"validate_fcm_token firebase error: {e}")
+            return False
+        except Exception as e:
+            app.logger.exception(f"validate_fcm_token hata: {e}")
+            return False
+    else:
+        return len(fcm_token) > 20
 
 # ---------- Routes ----------
 @app.route("/health")
@@ -315,7 +404,6 @@ def login():
     expires = timedelta(days=7)
     token = create_access_token(identity=user.username, expires_delta=expires)
 
-    # döndürülecek user objesi: kayıt sırasında girilen tüm bilgiler
     user_info = {
         "id": user.id,
         "username": user.username,
@@ -331,24 +419,26 @@ def login():
 
     return jsonify({"access_token": token, "user": user_info})
 
-# --- Device token registration for FCM ---
+# Device token registration
 @app.route("/auth/device/register", methods=["POST"])
 @jwt_required()
 def register_device():
     data = request.json or {}
     if "token" not in data:
         return jsonify({"msg": "token gerekli"}), 400
+    token = data["token"]
+    if not validate_fcm_token(token):
+        return jsonify({"msg": "Token geçersiz"}), 400
     current = get_jwt_identity()
     user = User.query.filter_by(username=current).first()
-    # prevent duplicate tokens
-    if DeviceToken.query.filter_by(token=data["token"], user_id=user.id).first():
+    if DeviceToken.query.filter_by(token=token, user_id=user.id).first():
         return jsonify({"msg": "Token zaten kayıtlı"})
-    dt = DeviceToken(token=data["token"], user_id=user.id)
+    dt = DeviceToken(token=token, user_id=user.id)
     db.session.add(dt)
     db.session.commit()
     return jsonify({"msg": "Device token kaydedildi"})
 
-# --- Category management ---
+# Categories
 @app.route("/admin/categories", methods=["POST"])
 @admin_required
 def create_category():
@@ -390,7 +480,7 @@ def delete_category(category_id):
     db.session.commit()
     return jsonify({"msg": "Kategori silindi", "category_id": category_id})
 
-# --- Product management ---
+# Product management
 @app.route("/admin/products", methods=["POST"])
 @admin_required
 def create_product():
@@ -398,7 +488,7 @@ def create_product():
         data = request.get_json()
         title = data.get("title")
         price_str = data.get("price")
-        stock_in = data.get("stock", "0")   # expecting string
+        stock_in = data.get("stock", "0")
         description = data.get("description", "")
         category_id = data.get("category_id")
         image_base64 = data.get("image_base64")
@@ -450,11 +540,11 @@ def create_product():
     db.session.add(p)
     db.session.commit()
 
-    # If initial discount > 0, notify users (FCM only)
+    # notify if discount > 0
     try:
         if float(p.discount_percent.replace(",", ".")) > 0:
-            current = get_jwt_identity()
-            notify_users_about_discount(p, triggered_by_admin_username=current)
+            notify_result = notify_users_about_discount(p)
+            app.logger.info(f"Discount notify result: {notify_result}")
     except Exception:
         pass
 
@@ -523,12 +613,12 @@ def update_product(product_id):
 
     db.session.commit()
 
-    # If discount changed and >0, notify users (FCM only)
+    # If discount changed and >0, notify users
     try:
         if old_discount != str(p.discount_percent):
             if float(str(p.discount_percent).replace(",", ".")) > 0:
-                current = get_jwt_identity()
-                notify_users_about_discount(p, triggered_by_admin_username=current)
+                notify_result = notify_users_about_discount(p)
+                app.logger.info(f"Discount notify result: {notify_result}")
     except Exception:
         pass
 
@@ -555,12 +645,10 @@ def set_discount(product_id):
     p.discount_percent = str(dp)
     db.session.commit()
 
-    # Notify users about discount (FCM only)
-    current = get_jwt_identity()
-    notify_result = notify_users_about_discount(p, triggered_by_admin_username=current)
+    notify_result = notify_users_about_discount(p)
     return jsonify({"msg": "İndirim uygulandı", "discount_percent": p.discount_percent, "notify_result": notify_result})
 
-# --- Search / List products ---
+# Products listing/search
 @app.route("/products", methods=["GET"])
 def list_products():
     q_text = request.args.get("q", type=str)
@@ -615,7 +703,7 @@ def list_products():
             "description": p.description,
             "price": str(p.price),
             "price_after_discount": p.price_after_discount,
-            "stock": str(p.stock),          # RETURN AS STRING
+            "stock": str(p.stock),
             "image_base64": p.image_base64,
             "image_mime": p.image_mime,
             "category": p.category.name if p.category else None,
@@ -630,7 +718,7 @@ def list_products():
         "products": out
     })
 
-# --- Cart endpoints ---
+# Cart operations
 @app.route("/cart", methods=["GET"])
 @jwt_required()
 def get_cart():
@@ -646,7 +734,7 @@ def get_cart():
                 "title": it.product.title,
                 "price": str(it.product.price),
                 "price_after_discount": it.product.price_after_discount,
-                "stock": str(it.product.stock),   # RETURN AS STRING
+                "stock": str(it.product.stock),
                 "image_base64": it.product.image_base64,
                 "image_mime": it.product.image_mime
             },
@@ -689,7 +777,7 @@ def remove_cart_item():
     db.session.commit()
     return jsonify({"msg": "Silindi"})
 
-# --- NEW: Update cart item quantity (PATCH + PUT supported) ---
+# Update cart item quantity (PATCH & PUT)
 @app.route("/cart/<int:cart_item_id>", methods=["PATCH", "PUT"])
 @jwt_required()
 def update_cart_item(cart_item_id):
@@ -697,7 +785,6 @@ def update_cart_item(cart_item_id):
     if "quantity" not in data:
         return jsonify({"msg": "quantity gerekli"}), 400
 
-    # parse quantity (int)
     try:
         qty = int(data["quantity"])
     except Exception:
@@ -708,25 +795,20 @@ def update_cart_item(cart_item_id):
 
     current = get_jwt_identity()
     user = User.query.filter_by(username=current).first_or_404()
-
     item = CartItem.query.get_or_404(cart_item_id)
 
-    # sadece öğeyi ekleyen kullanıcı değiştirebilir
     if item.user_id != user.id:
         return jsonify({"msg": "Bu sepet öğesini değiştirme yetkiniz yok"}), 403
 
-    # qty == 0 ise öğeyi sil
     if qty == 0:
         db.session.delete(item)
         db.session.commit()
         return jsonify({"msg": "Sepet öğesi silindi", "cart_item_id": cart_item_id})
 
-    # stok kontrolü
     product = item.product
     if product.stock < qty:
         return jsonify({"msg": "Yeterli stok yok", "available_stock": str(product.stock)}), 400
 
-    # güncelle
     item.quantity = qty
     db.session.commit()
 
@@ -745,7 +827,7 @@ def update_cart_item(cart_item_id):
     }
     return jsonify({"msg": "Sepet güncellendi", "cart_item": out})
 
-# --- Checkout / create order ---
+# Checkout
 @app.route("/cart/checkout", methods=["POST"])
 @jwt_required()
 def checkout():
@@ -783,17 +865,18 @@ def checkout():
         db.session.delete(it)
     db.session.commit()
 
+    # Notify admins
     admins = User.query.filter_by(role="admin").all()
-    for admin in admins:
-        tokens = [dt.token for dt in admin.device_tokens]
-        server_key_to_use = admin.fcm_server_key or GLOBAL_FCM_SERVER_KEY
-        if tokens and server_key_to_use:
-            title = "Yeni Sipariş"
-            body = f"#{order.id} numaralı sipariş oluşturuldu. Tutar: {order.total_amount} TL. Ödeme: {order.payment_method}"
-            send_fcm_notification(server_key_to_use, tokens, title, body, data={"order_id": order.id})
+    admin_tokens = [dt.token for a in admins for dt in a.device_tokens]
+    admin_keys = [a.fcm_server_key for a in admins if a.fcm_server_key]
+    if admin_tokens:
+        title = "Yeni Sipariş"
+        body = f"#{order.id} numaralı sipariş oluşturuldu. Tutar: {order.total_amount} TL. Ödeme: {order.payment_method}"
+        send_fcm_notification(admin_tokens, title, body, data={"order_id": str(order.id)}, fallback_server_keys=admin_keys)
+
     return jsonify({"msg": "Sipariş oluştu", "order_id": order.id, "payment_method": order.payment_method, "total_amount": order.total_amount})
 
-# --- Admin view orders ---
+# Admin orders
 @app.route("/admin/orders", methods=["GET"])
 @admin_required
 def admin_orders():
@@ -811,7 +894,7 @@ def admin_orders():
         })
     return jsonify(out)
 
-# --- Admin announcement via their FCM key (or global fallback) ---
+# Admin announce
 @app.route("/admin/announce", methods=["POST"])
 @admin_required
 def admin_announce():
@@ -824,10 +907,9 @@ def admin_announce():
         tokens = data["tokens"]
     else:
         tokens = [dt.token for u in User.query.filter_by(role="user").all() for dt in u.device_tokens]
-    server_key_to_use = admin.fcm_server_key or GLOBAL_FCM_SERVER_KEY
-    if not server_key_to_use:
-        return jsonify({"msg": "Admin için FCM server key tanımlı değil ve global fallback yok"}), 400
-    res = send_fcm_notification(server_key_to_use, tokens, data["title"], data["body"], data.get("data"))
+    admin_keys = [a.fcm_server_key for a in User.query.filter_by(role="admin").all() if a.fcm_server_key]
+    server_keys = admin_keys if admin_keys else None
+    res = send_fcm_notification(tokens, data["title"], data["body"], data.get("data"), fallback_server_keys=server_keys)
     return jsonify(res)
 
 @app.route("/admin/fcm_key", methods=["POST"])
@@ -862,7 +944,7 @@ def admin_summary():
         "total_income": total_income_str
     })
 
-# --- Kullanıcı kendi profilini görüntüleme / güncelleme ---
+# User profile
 @app.route("/me", methods=["GET"])
 @jwt_required()
 def get_me():
@@ -926,6 +1008,17 @@ def update_me():
         response["new_token"] = new_token
 
     return jsonify(response)
+
+# ---------- Helpers used earlier: notify discount ----------
+def notify_users_about_discount(product: Product):
+    title = f"{product.title} için {product.discount_percent}% indirim!"
+    body = f"{product.title} ürününde {product.discount_percent}% indirim başladı. Yeni fiyat: {product.price_after_discount} TL"
+
+    users = User.query.filter_by(role="user").all()
+    tokens = [dt.token for u in users for dt in u.device_tokens]
+    admin_keys = [a.fcm_server_key for a in User.query.filter_by(role="admin").all() if a.fcm_server_key]
+    res = send_fcm_notification(tokens, title, body, data={"product_id": str(product.id)}, fallback_server_keys=admin_keys)
+    return res
 
 # ---------- Run ----------
 if __name__ == "__main__":
