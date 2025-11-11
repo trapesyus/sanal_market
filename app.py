@@ -320,27 +320,47 @@ def send_fcm_notification(tokens, title, body, data=None, fallback_server_keys=N
             return res
     return {"success": False, "error": "No working FCM method available"}
 
+# DÜZELTİLMİŞ FCM TOKEN VALIDATION FONKSİYONU
 def validate_fcm_token(fcm_token):
     if not fcm_token:
+        app.logger.warning("validate_fcm_token: Token boş")
         return False
-    if firebase_app:
-        try:
-            msg = messaging.Message(token=fcm_token, data={"validation": "test"})
-            messaging.send(msg, dry_run=True)
+    
+    # Firebase başlatılmamışsa basit bir format kontrolü yap
+    if not firebase_app:
+        app.logger.warning("validate_fcm_token: Firebase başlatılmamış, basit kontrol yapılıyor")
+        # FCM token formatı: genellikle 2 nokta ile ayrılmış 2 kısım
+        if ':' in fcm_token and len(fcm_token) > 50:
             return True
-        except FirebaseError as e:
-            s = str(e).lower()
-            if any(x in s for x in ("unregistered", "not-found", "notregistered")):
-                return False
-            if any(x in s for x in ("invalid-argument", "invalid")):
-                return False
-            app.logger.exception(f"validate_fcm_token firebase error: {e}")
+        else:
+            app.logger.warning(f"validate_fcm_token: Token formatı uygun değil: {fcm_token[:50]}...")
             return False
-        except Exception as e:
-            app.logger.exception(f"validate_fcm_token hata: {e}")
+    
+    # Firebase başlatılmışsa dry-run ile test et
+    try:
+        msg = messaging.Message(
+            token=fcm_token, 
+            data={"validation": "test"}
+        )
+        messaging.send(msg, dry_run=True)
+        app.logger.info(f"validate_fcm_token: Token geçerli: {fcm_token[:20]}...")
+        return True
+    except FirebaseError as e:
+        error_str = str(e).lower()
+        app.logger.warning(f"validate_fcm_token FirebaseError: {error_str}")
+        
+        # Geçersiz token hataları
+        if any(x in error_str for x in ["unregistered", "not-found", "notregistered", "invalid-argument", "invalid"]):
+            app.logger.error(f"validate_fcm_token: Geçersiz token - {error_str}")
             return False
-    else:
-        return len(fcm_token) > 20
+        else:
+            # Diğer hatalarda (network vs.) token'ı kabul et
+            app.logger.warning(f"validate_fcm_token: Diğer hata, token kabul ediliyor: {error_str}")
+            return True
+    except Exception as e:
+        app.logger.exception(f"validate_fcm_token beklenmeyen hata: {e}")
+        # Beklenmeyen hatalarda token'ı kabul et
+        return True
 
 # ---------- Routes ----------
 @app.route("/health")
@@ -419,23 +439,42 @@ def login():
 
     return jsonify({"access_token": token, "user": user_info})
 
-# Device token registration
+# Device token registration - DÜZELTİLMİŞ VERSİYON
 @app.route("/auth/device/register", methods=["POST"])
 @jwt_required()
 def register_device():
     data = request.json or {}
     if "token" not in data:
         return jsonify({"msg": "token gerekli"}), 400
+    
     token = data["token"]
-    if not validate_fcm_token(token):
-        return jsonify({"msg": "Token geçersiz"}), 400
+    app.logger.info(f"Device token kaydı için gelen token: {token[:50]}...")
+    
+    # Token validation'ı daha esnek hale getir
+    if not token or len(token) < 10:
+        return jsonify({"msg": "Token çok kısa veya boş"}), 400
+    
+    # Basit format kontrolü
+    if ':' not in token:
+        app.logger.warning(f"Token formatı uygun değil: {token[:50]}...")
+        # Yine de devam et, belki farklı bir token formatıdır
+    
     current = get_jwt_identity()
     user = User.query.filter_by(username=current).first()
-    if DeviceToken.query.filter_by(token=token, user_id=user.id).first():
+    if not user:
+        return jsonify({"msg": "Kullanıcı bulunamadı"}), 404
+
+    # Aynı token zaten var mı kontrol et
+    existing_token = DeviceToken.query.filter_by(token=token, user_id=user.id).first()
+    if existing_token:
         return jsonify({"msg": "Token zaten kayıtlı"})
+
+    # Token'ı kaydet
     dt = DeviceToken(token=token, user_id=user.id)
     db.session.add(dt)
     db.session.commit()
+    
+    app.logger.info(f"Device token başarıyla kaydedildi: {token[:50]}...")
     return jsonify({"msg": "Device token kaydedildi"})
 
 # Categories
