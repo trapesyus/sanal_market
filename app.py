@@ -16,7 +16,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
-from sqlalchemy import or_, func, cast, Float
+from sqlalchemy import or_, func, cast, Float, text
 
 # Try import firebase_admin (preferred)
 try:
@@ -51,6 +51,35 @@ file_handler.setLevel(logging.INFO)
 app.logger.setLevel(logging.INFO)
 app.logger.addHandler(file_handler)
 app.logger.addHandler(logging.StreamHandler())
+
+# ---------- Database Setup ----------
+def setup_database():
+    """Veritabanı tablolarını ve gerekli sütunları oluştur"""
+    try:
+        with app.app_context():
+            # Temel tabloları oluştur
+            db.create_all()
+            
+            # Eksik sütunları kontrol et ve ekle
+            with db.engine.connect() as conn:
+                # product tablosunda image_base64 sütunu var mı kontrol et
+                result = conn.execute(text("PRAGMA table_info(product)"))
+                columns = [row[1] for row in result]
+                
+                if 'image_base64' not in columns:
+                    app.logger.info("image_base64 sütunu ekleniyor...")
+                    conn.execute(text("ALTER TABLE product ADD COLUMN image_base64 TEXT"))
+                
+                if 'image_mime' not in columns:
+                    app.logger.info("image_mime sütunu ekleniyor...")
+                    conn.execute(text("ALTER TABLE product ADD COLUMN image_mime VARCHAR(80)"))
+                
+                conn.commit()
+            
+            app.logger.info("Veritabanı başarıyla kuruldu ve güncellendi")
+            
+    except Exception as e:
+        app.logger.error(f"Veritabanı kurulum hatası: {e}")
 
 # ---------- Models ----------
 class User(db.Model):
@@ -89,8 +118,8 @@ class Product(db.Model):
     description = db.Column(db.Text)
     price = db.Column(db.String(64), nullable=False)   # string per requirement
     stock = db.Column(db.Integer, default=0)           # stored as int internally
-    image_base64 = db.Column(db.Text, nullable=True)
-    image_mime = db.Column(db.String(80), nullable=True)
+    image_base64 = db.Column(db.Text, nullable=True)   # Resim base64 formatında
+    image_mime = db.Column(db.String(80), nullable=True) # Resim MIME type
     category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
     discount_percent = db.Column(db.String(64), default="0")  # string percent
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -465,11 +494,6 @@ def register_device():
     # Token validation'ı daha esnek hale getir
     if not token or len(token) < 10:
         return jsonify({"msg": "Token çok kısa veya boş"}), 400
-    
-    # Basit format kontrolü
-    if ':' not in token:
-        app.logger.warning(f"Token formatı uygun değil: {token[:50]}...")
-        # Yine de devam et, belki farklı bir token formatıdır
     
     current = get_jwt_identity()
     user = User.query.filter_by(username=current).first()
@@ -925,14 +949,21 @@ def checkout():
         db.session.delete(it)
     db.session.commit()
 
-    # Admin'lere bildirim gönder - GELİŞTİRİLMİŞ
+    # DEBUG: Admin ve token bilgilerini logla
     admins = User.query.filter_by(role="admin").all()
     admin_tokens = [dt.token for a in admins for dt in a.device_tokens]
     admin_keys = [a.fcm_server_key for a in admins if a.fcm_server_key]
     
-    app.logger.info(f"Checkout: {len(admin_tokens)} admin token bulundu")
-    app.logger.info(f"Checkout: {len(admin_keys)} admin FCM key bulundu")
+    app.logger.info("=== SİPARİŞ BİLDİRİM DEBUG ===")
+    app.logger.info(f"Toplam admin sayısı: {len(admins)}")
+    for admin in admins:
+        tokens = [dt.token for dt in admin.device_tokens]
+        app.logger.info(f"Admin: {admin.username}, Token sayısı: {len(tokens)}")
+    app.logger.info(f"Toplam admin token: {len(admin_tokens)}")
+    app.logger.info(f"Toplam admin FCM key: {len(admin_keys)}")
+    app.logger.info("=== DEBUG SONU ===")
     
+    # Admin'lere bildirim gönder
     if admin_tokens:
         title = "Yeni Sipariş"
         body = f"#{order.id} numaralı sipariş oluşturuldu. Tutar: {order.total_amount} TL. Ödeme: {order.payment_method}"
@@ -954,6 +985,8 @@ def checkout():
             fallback_server_keys=admin_keys
         )
         app.logger.info(f"Admin bildirim sonucu: {notify_result}")
+    else:
+        app.logger.warning("Admin token bulunamadığı için bildirim gönderilmedi")
 
     return jsonify({
         "msg": "Sipariş oluştu", 
@@ -1135,6 +1168,6 @@ def notify_users_about_discount(product: Product):
 
 # ---------- Run ----------
 if __name__ == "__main__":
-    with app.app_context():
-        db.create_all()
+    # Veritabanını kur
+    setup_database()
     app.run(host="0.0.0.0", port=8000, debug=True)
