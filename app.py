@@ -74,6 +74,21 @@ def setup_database():
                     app.logger.info("image_mime sütunu ekleniyor...")
                     conn.execute(text("ALTER TABLE product ADD COLUMN image_mime VARCHAR(80)"))
                 
+                # announcements tablosu var mı kontrol et
+                result = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='announcement'"))
+                if not result.fetchone():
+                    app.logger.info("announcements tablosu oluşturuluyor...")
+                    conn.execute(text("""
+                        CREATE TABLE announcement (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            title VARCHAR(200) NOT NULL,
+                            body TEXT NOT NULL,
+                            admin_id INTEGER NOT NULL,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (admin_id) REFERENCES user (id)
+                        )
+                    """))
+                
                 conn.commit()
             
             app.logger.info("Veritabanı başarıyla kuruldu ve güncellendi")
@@ -171,6 +186,14 @@ class OrderItem(db.Model):
     quantity = db.Column(db.Integer, nullable=False)
     unit_price = db.Column(db.String(64), nullable=False)
     product = db.relationship("Product")
+
+class Announcement(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    body = db.Column(db.Text, nullable=False)
+    admin_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    admin = db.relationship("User")
 
 # ---------- Helpers ----------
 def admin_required(fn):
@@ -1013,7 +1036,36 @@ def admin_orders():
         })
     return jsonify(out)
 
-# Admin announce - GELİŞTİRİLMİŞ
+# Announcements - YENİ EKLENDİ
+@app.route("/announcements", methods=["GET"])
+@jwt_required()
+def get_announcements():
+    page = request.args.get("page", default=1, type=int)
+    per_page = request.args.get("per_page", default=20, type=int)
+    
+    announcements = Announcement.query.order_by(Announcement.created_at.desc()).paginate(
+        page=page, per_page=per_page, error_out=False
+    )
+    
+    out = []
+    for ann in announcements.items:
+        out.append({
+            "id": ann.id,
+            "title": ann.title,
+            "body": ann.body,
+            "admin_name": f"{ann.admin.name} {ann.admin.surname}",
+            "created_at": ann.created_at.isoformat()
+        })
+    
+    return jsonify({
+        "announcements": out,
+        "total": announcements.total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": announcements.pages
+    })
+
+# Admin announce - GELİŞTİRİLMİŞ (DUYURU KAYDI EKLENDİ)
 @app.route("/admin/announce", methods=["POST"])
 @admin_required
 def admin_announce():
@@ -1023,6 +1075,15 @@ def admin_announce():
     
     current = get_jwt_identity()
     admin = User.query.filter_by(username=current).first()
+    
+    # Duyuruyu veritabanına kaydet
+    announcement = Announcement(
+        title=data["title"],
+        body=data["body"],
+        admin_id=admin.id
+    )
+    db.session.add(announcement)
+    db.session.commit()
     
     # Hangi token'lara gönderilecek
     if "tokens" in data and isinstance(data["tokens"], list) and data["tokens"]:
@@ -1047,6 +1108,9 @@ def admin_announce():
         fallback_server_keys=server_keys
     )
     
+    # Yanıta duyuru ID'sini de ekle
+    res["announcement_id"] = announcement.id
+    
     return jsonify(res)
 
 @app.route("/admin/fcm_key", methods=["POST"])
@@ -1067,6 +1131,7 @@ def admin_summary():
     total_products = Product.query.count()
     total_orders = Order.query.count()
     total_users = User.query.filter_by(role="user").count()
+    total_announcements = Announcement.query.count()
     total_income_val = 0.0
     for o in Order.query.all():
         try:
@@ -1078,10 +1143,11 @@ def admin_summary():
         "total_products": total_products,
         "total_orders": total_orders,
         "total_users": total_users,
+        "total_announcements": total_announcements,
         "total_income": total_income_str
     })
 
-# User profile
+# User profile - GÜNCELLENDİ (PATCH EKLENDİ)
 @app.route("/me", methods=["GET"])
 @jwt_required()
 def get_me():
@@ -1142,6 +1208,107 @@ def update_me():
     if original_username != user.username:
         expires = timedelta(days=7)
         new_token = create_access_token(identity=user.username, expires_delta=expires)
+        response["new_token"] = new_token
+
+    return jsonify(response)
+
+# YENİ: Kullanıcı için PATCH endpoint'i
+@app.route("/me", methods=["PATCH"])
+@jwt_required()
+def patch_me():
+    data = request.json or {}
+    current_identity = get_jwt_identity()
+    user = User.query.filter_by(username=current_identity).first_or_404()
+
+    original_username = user.username
+
+    # Sadece gönderilen alanları güncelle
+    if "username" in data and data["username"] and data["username"] != user.username:
+        if User.query.filter_by(username=data["username"]).first():
+            return jsonify({"msg": "Bu kullanıcı adı zaten alınmış"}), 400
+        user.username = data["username"]
+
+    if "email" in data and data["email"] and data["email"] != user.email:
+        if User.query.filter(User.email == data["email"], User.id != user.id).first():
+            return jsonify({"msg": "Bu e-posta başka bir hesapta kullanılıyor"}), 400
+        user.email = data["email"]
+
+    # İsteğe bağlı alanlar
+    optional_fields = ["name", "surname", "phone", "address"]
+    for field in optional_fields:
+        if field in data:
+            setattr(user, field, data[field])
+
+    # Şifre güncelleme
+    if "new_password" in data:
+        if "current_password" not in data or not user.check_password(data["current_password"]):
+            return jsonify({"msg": "Mevcut şifre yanlış veya sağlanmadı"}), 400
+        user.set_password(data["new_password"])
+
+    db.session.commit()
+
+    response = {"msg": "Profil güncellendi", "user": {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "name": user.name,
+        "surname": user.surname,
+        "phone": user.phone,
+        "address": user.address
+    }}
+    if original_username != user.username:
+        expires = timedelta(days=7)
+        new_token = create_access_token(identity=user.username, expires_delta=expires)
+        response["new_token"] = new_token
+
+    return jsonify(response)
+
+# YENİ: Admin profil güncelleme (PATCH)
+@app.route("/admin/me", methods=["PATCH"])
+@admin_required
+def patch_admin_me():
+    data = request.json or {}
+    current_identity = get_jwt_identity()
+    admin = User.query.filter_by(username=current_identity).first_or_404()
+
+    original_username = admin.username
+
+    # Sadece gönderilen alanları güncelle
+    if "username" in data and data["username"] and data["username"] != admin.username:
+        if User.query.filter_by(username=data["username"]).first():
+            return jsonify({"msg": "Bu kullanıcı adı zaten alınmış"}), 400
+        admin.username = data["username"]
+
+    if "email" in data and data["email"] and data["email"] != admin.email:
+        if User.query.filter(User.email == data["email"], User.id != admin.id).first():
+            return jsonify({"msg": "Bu e-posta başka bir hesapta kullanılıyor"}), 400
+        admin.email = data["email"]
+
+    # İsteğe bağlı alanlar (admin için phone ve name, surname)
+    optional_fields = ["name", "surname", "phone"]
+    for field in optional_fields:
+        if field in data:
+            setattr(admin, field, data[field])
+
+    # Şifre güncelleme
+    if "new_password" in data:
+        if "current_password" not in data or not admin.check_password(data["current_password"]):
+            return jsonify({"msg": "Mevcut şifre yanlış veya sağlanmadı"}), 400
+        admin.set_password(data["new_password"])
+
+    db.session.commit()
+
+    response = {"msg": "Admin profili güncellendi", "admin": {
+        "id": admin.id,
+        "username": admin.username,
+        "email": admin.email,
+        "name": admin.name,
+        "surname": admin.surname,
+        "phone": admin.phone
+    }}
+    if original_username != admin.username:
+        expires = timedelta(days=7)
+        new_token = create_access_token(identity=admin.username, expires_delta=expires)
         response["new_token"] = new_token
 
     return jsonify(response)
