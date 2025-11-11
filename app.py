@@ -222,7 +222,7 @@ def _parse_stock_value(s):
         raise ValueError("stock integer formatında olmalı (örn. '10')")
 
 # ---------- Firebase / FCM Setup ----------
-SERVICE_ACCOUNT_PATH = "/root/perem-sanal.json"  # as requested
+SERVICE_ACCOUNT_PATH = "/root/perem-sa-new.json"  # as requested
 firebase_app = None
 
 if FIREBASE_AVAILABLE:
