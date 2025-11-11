@@ -257,7 +257,8 @@ def send_fcm_via_firebase(tokens, title, body, data=None):
                                                notification=messaging.AndroidNotification(sound="default", click_action="FLUTTER_NOTIFICATION_CLICK")),
                 apns=messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound="default", badge=1)))
             )
-            resp = messaging.send_multicast(message)
+            # DÜZELTME: send_multicast yerine send_each_for_multicast kullan
+            resp = messaging.send_each_for_multicast(message)
             summary["success_count"] += resp.success_count
             summary["failure_count"] += resp.failure_count
             for i, r in enumerate(resp.responses):
@@ -299,11 +300,18 @@ def send_fcm_legacy(server_key, tokens, title, body, data=None):
 def send_fcm_notification(tokens, title, body, data=None, fallback_server_keys=None):
     if not tokens:
         return {"success": False, "error": "no tokens provided"}
+    
+    app.logger.info(f"FCM gönderiliyor: {len(tokens)} token, başlık: {title}")
+    
     # try firebase_admin first
     if firebase_app:
         res = send_fcm_via_firebase(tokens, title, body, data or {})
         if res.get("success"):
+            app.logger.info(f"Firebase Admin ile gönderim başarılı: {res.get('summary', {})}")
             return res
+        else:
+            app.logger.warning(f"Firebase Admin ile gönderim başarısız: {res.get('error')}")
+    
     # fallback with provided keys
     if fallback_server_keys:
         for sk in fallback_server_keys:
@@ -311,13 +319,17 @@ def send_fcm_notification(tokens, title, body, data=None, fallback_server_keys=N
                 continue
             res = send_fcm_legacy(sk, tokens, title, body, data or {})
             if res.get("success"):
+                app.logger.info(f"Legacy FCM ile gönderim başarılı: {res.get('status_code')}")
                 return res
+    
     # try global env key
     env_key = os.environ.get("GLOBAL_LEGACY_FCM_SERVER_KEY")
     if env_key:
         res = send_fcm_legacy(env_key, tokens, title, body, data or {})
         if res.get("success"):
             return res
+    
+    app.logger.error("Hiçbir FCM yöntemi çalışmadı")
     return {"success": False, "error": "No working FCM method available"}
 
 # DÜZELTİLMİŞ FCM TOKEN VALIDATION FONKSİYONU
@@ -866,7 +878,7 @@ def update_cart_item(cart_item_id):
     }
     return jsonify({"msg": "Sepet güncellendi", "cart_item": out})
 
-# Checkout
+# Checkout - GELİŞTİRİLMİŞ BİLDİRİM SİSTEMİ
 @app.route("/cart/checkout", methods=["POST"])
 @jwt_required()
 def checkout():
@@ -882,10 +894,15 @@ def checkout():
     items = CartItem.query.filter_by(user_id=user.id).all()
     if not items:
         return jsonify({"msg": "Sepet boş"}), 400
-    total = 0.0
+    
+    # Stok kontrolü
     for it in items:
         if it.product.stock < it.quantity:
             return jsonify({"msg": f"{it.product.title} için yeterli stok yok"}), 400
+
+    # Toplam tutarı hesapla
+    total = 0.0
+    for it in items:
         try:
             unit = float(it.product.price_after_discount.replace(",", "."))
         except Exception:
@@ -893,9 +910,13 @@ def checkout():
         total += unit * it.quantity
 
     total_rounded = round(total, 2)
+    
+    # Sipariş oluştur
     order = Order(user_id=user.id, total_amount=f"{total_rounded:.2f}", payment_method=payment_method)
     db.session.add(order)
     db.session.commit()
+    
+    # Sipariş öğelerini oluştur ve stokları güncelle
     for it in items:
         unit_price_str = it.product.price_after_discount
         oi = OrderItem(order_id=order.id, product_id=it.product.id, quantity=it.quantity, unit_price=str(unit_price_str))
@@ -904,16 +925,42 @@ def checkout():
         db.session.delete(it)
     db.session.commit()
 
-    # Notify admins
+    # Admin'lere bildirim gönder - GELİŞTİRİLMİŞ
     admins = User.query.filter_by(role="admin").all()
     admin_tokens = [dt.token for a in admins for dt in a.device_tokens]
     admin_keys = [a.fcm_server_key for a in admins if a.fcm_server_key]
+    
+    app.logger.info(f"Checkout: {len(admin_tokens)} admin token bulundu")
+    app.logger.info(f"Checkout: {len(admin_keys)} admin FCM key bulundu")
+    
     if admin_tokens:
         title = "Yeni Sipariş"
         body = f"#{order.id} numaralı sipariş oluşturuldu. Tutar: {order.total_amount} TL. Ödeme: {order.payment_method}"
-        send_fcm_notification(admin_tokens, title, body, data={"order_id": str(order.id)}, fallback_server_keys=admin_keys)
+        
+        # Detaylı sipariş bilgisi
+        order_data = {
+            "order_id": str(order.id),
+            "total_amount": order.total_amount,
+            "payment_method": order.payment_method,
+            "user_name": f"{user.name} {user.surname}",
+            "type": "new_order"
+        }
+        
+        notify_result = send_fcm_notification(
+            admin_tokens, 
+            title, 
+            body, 
+            data=order_data, 
+            fallback_server_keys=admin_keys
+        )
+        app.logger.info(f"Admin bildirim sonucu: {notify_result}")
 
-    return jsonify({"msg": "Sipariş oluştu", "order_id": order.id, "payment_method": order.payment_method, "total_amount": order.total_amount})
+    return jsonify({
+        "msg": "Sipariş oluştu", 
+        "order_id": order.id, 
+        "payment_method": order.payment_method, 
+        "total_amount": order.total_amount
+    })
 
 # Admin orders
 @app.route("/admin/orders", methods=["GET"])
@@ -933,22 +980,40 @@ def admin_orders():
         })
     return jsonify(out)
 
-# Admin announce
+# Admin announce - GELİŞTİRİLMİŞ
 @app.route("/admin/announce", methods=["POST"])
 @admin_required
 def admin_announce():
     data = request.json or {}
     if "title" not in data or "body" not in data:
         return jsonify({"msg": "title ve body gerekli"}), 400
+    
     current = get_jwt_identity()
     admin = User.query.filter_by(username=current).first()
+    
+    # Hangi token'lara gönderilecek
     if "tokens" in data and isinstance(data["tokens"], list) and data["tokens"]:
         tokens = data["tokens"]
+        app.logger.info(f"Manuel token listesi ile duyuru: {len(tokens)} token")
     else:
-        tokens = [dt.token for u in User.query.filter_by(role="user").all() for dt in u.device_tokens]
+        # Tüm kullanıcılara gönder
+        users = User.query.filter_by(role="user").all()
+        tokens = [dt.token for u in users for dt in u.device_tokens]
+        app.logger.info(f"Tüm kullanıcılara duyuru: {len(users)} kullanıcı, {len(tokens)} token")
+    
     admin_keys = [a.fcm_server_key for a in User.query.filter_by(role="admin").all() if a.fcm_server_key]
     server_keys = admin_keys if admin_keys else None
-    res = send_fcm_notification(tokens, data["title"], data["body"], data.get("data"), fallback_server_keys=server_keys)
+    
+    app.logger.info(f"Duyuru gönderiliyor: {data['title']} - {len(tokens)} token")
+    
+    res = send_fcm_notification(
+        tokens, 
+        data["title"], 
+        data["body"], 
+        data.get("data"), 
+        fallback_server_keys=server_keys
+    )
+    
     return jsonify(res)
 
 @app.route("/admin/fcm_key", methods=["POST"])
@@ -1056,7 +1121,16 @@ def notify_users_about_discount(product: Product):
     users = User.query.filter_by(role="user").all()
     tokens = [dt.token for u in users for dt in u.device_tokens]
     admin_keys = [a.fcm_server_key for a in User.query.filter_by(role="admin").all() if a.fcm_server_key]
-    res = send_fcm_notification(tokens, title, body, data={"product_id": str(product.id)}, fallback_server_keys=admin_keys)
+    
+    app.logger.info(f"İndirim bildirimi: {len(tokens)} kullanıcı token'ı bulundu")
+    
+    res = send_fcm_notification(
+        tokens, 
+        title, 
+        body, 
+        data={"product_id": str(product.id), "type": "discount"}, 
+        fallback_server_keys=admin_keys
+    )
     return res
 
 # ---------- Run ----------
