@@ -689,6 +689,62 @@ def remove_cart_item():
     db.session.commit()
     return jsonify({"msg": "Silindi"})
 
+# --- NEW: Update cart item quantity (PATCH + PUT supported) ---
+@app.route("/cart/<int:cart_item_id>", methods=["PATCH", "PUT"])
+@jwt_required()
+def update_cart_item(cart_item_id):
+    data = request.json or {}
+    if "quantity" not in data:
+        return jsonify({"msg": "quantity gerekli"}), 400
+
+    # parse quantity (int)
+    try:
+        qty = int(data["quantity"])
+    except Exception:
+        return jsonify({"msg": "quantity integer olmalı"}), 400
+
+    if qty < 0:
+        return jsonify({"msg": "quantity negatif olamaz"}), 400
+
+    current = get_jwt_identity()
+    user = User.query.filter_by(username=current).first_or_404()
+
+    item = CartItem.query.get_or_404(cart_item_id)
+
+    # sadece öğeyi ekleyen kullanıcı değiştirebilir
+    if item.user_id != user.id:
+        return jsonify({"msg": "Bu sepet öğesini değiştirme yetkiniz yok"}), 403
+
+    # qty == 0 ise öğeyi sil
+    if qty == 0:
+        db.session.delete(item)
+        db.session.commit()
+        return jsonify({"msg": "Sepet öğesi silindi", "cart_item_id": cart_item_id})
+
+    # stok kontrolü
+    product = item.product
+    if product.stock < qty:
+        return jsonify({"msg": "Yeterli stok yok", "available_stock": str(product.stock)}), 400
+
+    # güncelle
+    item.quantity = qty
+    db.session.commit()
+
+    out = {
+        "id": item.id,
+        "product": {
+            "id": product.id,
+            "title": product.title,
+            "price": str(product.price),
+            "price_after_discount": product.price_after_discount,
+            "stock": str(product.stock),
+            "image_base64": product.image_base64,
+            "image_mime": product.image_mime
+        },
+        "quantity": item.quantity
+    }
+    return jsonify({"msg": "Sepet güncellendi", "cart_item": out})
+
 # --- Checkout / create order ---
 @app.route("/cart/checkout", methods=["POST"])
 @jwt_required()
