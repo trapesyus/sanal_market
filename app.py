@@ -1294,10 +1294,12 @@ def admin_order_detail(order_id):
     order = Order.query.get_or_404(order_id)
     return jsonify(format_order_response(order))
 
-# Announcements
+# ========== YENİ: DUYURULAR İÇİN GELİŞTİRİLMİŞ ENDPOINT'LER ==========
+
 @app.route("/announcements", methods=["GET"])
 @jwt_required()
 def get_announcements():
+    """Hem admin hem de kullanıcılar için duyuruları listeler"""
     page = request.args.get("page", default=1, type=int)
     per_page = request.args.get("per_page", default=20, type=int)
     
@@ -1312,6 +1314,73 @@ def get_announcements():
             "title": ann.title,
             "body": ann.body,
             "admin_name": f"{ann.admin.name} {ann.admin.surname}",
+            "created_at": ann.created_at.isoformat()
+        })
+    
+    return jsonify({
+        "announcements": out,
+        "total": announcements.total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": announcements.pages
+    })
+
+@app.route("/announcements/<int:announcement_id>", methods=["GET"])
+@jwt_required()
+def get_announcement(announcement_id):
+    """Belirli bir duyurunun detayını getirir"""
+    announcement = Announcement.query.get_or_404(announcement_id)
+    
+    return jsonify({
+        "id": announcement.id,
+        "title": announcement.title,
+        "body": announcement.body,
+        "admin_name": f"{announcement.admin.name} {announcement.admin.surname}",
+        "admin_email": announcement.admin.email,
+        "created_at": announcement.created_at.isoformat()
+    })
+
+@app.route("/admin/announcements/<int:announcement_id>", methods=["DELETE"])
+@admin_required
+def delete_announcement(announcement_id):
+    """Admin duyuru silme"""
+    announcement = Announcement.query.get_or_404(announcement_id)
+    
+    # Mevcut kullanıcının admin olduğunu kontrol et (zaten admin_required decorator var)
+    current = get_jwt_identity()
+    admin = User.query.filter_by(username=current).first()
+    
+    # Duyuruyu sil
+    db.session.delete(announcement)
+    db.session.commit()
+    
+    app.logger.info(f"Admin #{admin.id} duyuru #{announcement_id} sildi")
+    
+    return jsonify({
+        "msg": "Duyuru silindi",
+        "announcement_id": announcement_id
+    })
+
+@app.route("/admin/announcements", methods=["GET"])
+@admin_required
+def admin_get_announcements():
+    """Admin için duyuruları listeler (tüm duyurular)"""
+    page = request.args.get("page", default=1, type=int)
+    per_page = request.args.get("per_page", default=50, type=int)
+    
+    announcements = Announcement.query.order_by(Announcement.created_at.desc()).paginate(
+        page=page, per_page=per_page, error_out=False
+    )
+    
+    out = []
+    for ann in announcements.items:
+        out.append({
+            "id": ann.id,
+            "title": ann.title,
+            "body": ann.body,
+            "admin_id": ann.admin_id,
+            "admin_name": f"{ann.admin.name} {ann.admin.surname}",
+            "admin_email": ann.admin.email,
             "created_at": ann.created_at.isoformat()
         })
     
