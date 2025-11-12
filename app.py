@@ -89,6 +89,14 @@ def setup_database():
                         )
                     """))
                 
+                # order tablosunda delivery_address sütunu var mı kontrol et
+                result = conn.execute(text("PRAGMA table_info('order')"))
+                columns = [row[1] for row in result]
+                
+                if 'delivery_address' not in columns:
+                    app.logger.info("delivery_address sütunu ekleniyor...")
+                    conn.execute(text("ALTER TABLE 'order' ADD COLUMN delivery_address TEXT"))
+                
                 conn.commit()
             
             app.logger.info("Veritabanı başarıyla kuruldu ve güncellendi")
@@ -174,10 +182,13 @@ class Order(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     total_amount = db.Column(db.String(64), nullable=False)  # string
-    status = db.Column(db.String(50), default="new")
+    status = db.Column(db.String(50), default="new")  # new, yolda, teslim_edildi, teslim_edilemedi
     payment_method = db.Column(db.String(50), default="kapida_nakit")
+    delivery_address = db.Column(db.Text, nullable=True)  # Teslimat adresi
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     items = db.relationship("OrderItem", backref="order", lazy=True)
+    user = db.relationship("User", backref="orders")
 
 class OrderItem(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -309,7 +320,6 @@ def send_fcm_via_firebase(tokens, title, body, data=None):
                                                notification=messaging.AndroidNotification(sound="default", click_action="FLUTTER_NOTIFICATION_CLICK")),
                 apns=messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound="default", badge=1)))
             )
-            # DÜZELTME: send_multicast yerine send_each_for_multicast kullan
             resp = messaging.send_each_for_multicast(message)
             summary["success_count"] += resp.success_count
             summary["failure_count"] += resp.failure_count
@@ -384,7 +394,6 @@ def send_fcm_notification(tokens, title, body, data=None, fallback_server_keys=N
     app.logger.error("Hiçbir FCM yöntemi çalışmadı")
     return {"success": False, "error": "No working FCM method available"}
 
-# DÜZELTİLMİŞ FCM TOKEN VALIDATION FONKSİYONU
 def validate_fcm_token(fcm_token):
     if not fcm_token:
         app.logger.warning("validate_fcm_token: Token boş")
@@ -425,6 +434,30 @@ def validate_fcm_token(fcm_token):
         app.logger.exception(f"validate_fcm_token beklenmeyen hata: {e}")
         # Beklenmeyen hatalarda token'ı kabul et
         return True
+
+def format_order_response(order):
+    """Sipariş nesnesini JSON formatında döndür"""
+    return {
+        "id": order.id,
+        "user_id": order.user_id,
+        "user_name": f"{order.user.name} {order.user.surname}",
+        "user_phone": order.user.phone,
+        "user_email": order.user.email,
+        "total_amount": str(order.total_amount),
+        "status": order.status,
+        "payment_method": order.payment_method,
+        "delivery_address": order.delivery_address or order.user.address,
+        "created_at": order.created_at.isoformat(),
+        "updated_at": order.updated_at.isoformat() if order.updated_at else order.created_at.isoformat(),
+        "items": [{
+            "id": it.id,
+            "product_id": it.product_id,
+            "product_title": it.product.title,
+            "quantity": it.quantity,
+            "unit_price": str(it.unit_price),
+            "subtotal": f"{float(str(it.unit_price).replace(',', '.')) * it.quantity:.2f}"
+        } for it in order.items]
+    }
 
 # ---------- Routes ----------
 @app.route("/health")
@@ -503,7 +536,7 @@ def login():
 
     return jsonify({"access_token": token, "user": user_info})
 
-# Device token registration - DÜZELTİLMİŞ VERSİYON
+# Device token registration
 @app.route("/auth/device/register", methods=["POST"])
 @jwt_required()
 def register_device():
@@ -676,7 +709,7 @@ def update_product(product_id):
             dp = data.get("discount_percent")
             if dp is not None:
                 if not _is_numeric_string(dp):
-                    return jsonify({"msg": "discount_percent numeric string formatında olmalı"}), 400
+                    return jsonify({"msg": "discount_percent numeric stringında olmalı"}), 400
                 p.discount_percent = str(dp)
         if "image_base64" in data:
             p.image_base64 = data.get("image_base64")
@@ -701,7 +734,7 @@ def update_product(product_id):
         if "discount_percent" in data:
             dp = data["discount_percent"]
             if not _is_numeric_string(dp):
-                return jsonify({"msg": "discount_percent numeric string formatında olmalı"}), 400
+                return jsonify({"msg": "discount_percent numeric stringında olmalı"}), 400
             p.discount_percent = str(dp)
         if "image" in request.files:
             file = request.files["image"]
@@ -739,7 +772,7 @@ def set_discount(product_id):
         return jsonify({"msg": "discount_percent gerekli"}), 400
     dp = data.get("discount_percent")
     if dp is None or not _is_numeric_string(dp):
-        return jsonify({"msg": "discount_percent numeric string formatında olmalı"}), 400
+        return jsonify({"msg": "discount_percent numeric stringında olmalı"}), 400
     p.discount_percent = str(dp)
     db.session.commit()
 
@@ -925,12 +958,14 @@ def update_cart_item(cart_item_id):
     }
     return jsonify({"msg": "Sepet güncellendi", "cart_item": out})
 
-# Checkout - GELİŞTİRİLMİŞ BİLDİRİM SİSTEMİ
+# Checkout
 @app.route("/cart/checkout", methods=["POST"])
 @jwt_required()
 def checkout():
     data = request.json or {}
     payment_method = data.get("payment_method", "kapida_nakit")
+    delivery_address = data.get("delivery_address")  # Özel teslimat adresi
+    
     if payment_method in ("card_on_delivery", "kapida_kart"):
         payment_method = "kapida_kart"
     else:
@@ -958,8 +993,16 @@ def checkout():
 
     total_rounded = round(total, 2)
     
+    # Teslimat adresini belirle (gönderilmişse özel adresi kullan, yoksa kullanıcı adresini)
+    final_address = delivery_address if delivery_address else user.address
+    
     # Sipariş oluştur
-    order = Order(user_id=user.id, total_amount=f"{total_rounded:.2f}", payment_method=payment_method)
+    order = Order(
+        user_id=user.id, 
+        total_amount=f"{total_rounded:.2f}", 
+        payment_method=payment_method,
+        delivery_address=final_address
+    )
     db.session.add(order)
     db.session.commit()
     
@@ -972,26 +1015,17 @@ def checkout():
         db.session.delete(it)
     db.session.commit()
 
-    # DEBUG: Admin ve token bilgilerini logla
+    # Admin'lere bildirim gönder
     admins = User.query.filter_by(role="admin").all()
     admin_tokens = [dt.token for a in admins for dt in a.device_tokens]
     admin_keys = [a.fcm_server_key for a in admins if a.fcm_server_key]
     
-    app.logger.info("=== SİPARİŞ BİLDİRİM DEBUG ===")
-    app.logger.info(f"Toplam admin sayısı: {len(admins)}")
-    for admin in admins:
-        tokens = [dt.token for dt in admin.device_tokens]
-        app.logger.info(f"Admin: {admin.username}, Token sayısı: {len(tokens)}")
-    app.logger.info(f"Toplam admin token: {len(admin_tokens)}")
-    app.logger.info(f"Toplam admin FCM key: {len(admin_keys)}")
-    app.logger.info("=== DEBUG SONU ===")
+    app.logger.info(f"Sipariş #{order.id} oluşturuldu. Admin bildirim gönderiliyor...")
     
-    # Admin'lere bildirim gönder
     if admin_tokens:
         title = "Yeni Sipariş"
         body = f"#{order.id} numaralı sipariş oluşturuldu. Tutar: {order.total_amount} TL. Ödeme: {order.payment_method}"
         
-        # Detaylı sipariş bilgisi
         order_data = {
             "order_id": str(order.id),
             "total_amount": order.total_amount,
@@ -1015,28 +1049,252 @@ def checkout():
         "msg": "Sipariş oluştu", 
         "order_id": order.id, 
         "payment_method": order.payment_method, 
-        "total_amount": order.total_amount
+        "total_amount": order.total_amount,
+        "delivery_address": final_address
     })
 
-# Admin orders
+# ========== YENİ: KULLANICI SİPARİŞLERİ ==========
+@app.route("/orders/my", methods=["GET"])
+@jwt_required()
+def get_my_orders():
+    """Kullanıcın kendi siparişlerini listeler"""
+    current = get_jwt_identity()
+    user = User.query.filter_by(username=current).first_or_404()
+    
+    # Filtreleme parametreleri
+    status = request.args.get("status")  # new, yolda, teslim_edildi, teslim_edilemedi
+    page = request.args.get("page", default=1, type=int)
+    per_page = request.args.get("per_page", default=20, type=int)
+    
+    if per_page > 100:
+        per_page = 100
+    
+    # Sorgu oluştur
+    query = Order.query.filter_by(user_id=user.id)
+    
+    if status:
+        query = query.filter_by(status=status)
+    
+    query = query.order_by(Order.created_at.desc())
+    
+    # Sayfalama
+    total = query.count()
+    total_pages = (total + per_page - 1) // per_page if per_page else 1
+    orders = query.offset((page - 1) * per_page).limit(per_page).all()
+    
+    return jsonify({
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+        "orders": [format_order_response(o) for o in orders]
+    })
+
+@app.route("/orders/my/<int:order_id>", methods=["GET"])
+@jwt_required()
+def get_my_order_detail(order_id):
+    """Kullanıcın belirli bir siparişinin detayını getirir"""
+    current = get_jwt_identity()
+    user = User.query.filter_by(username=current).first_or_404()
+    
+    order = Order.query.get_or_404(order_id)
+    
+    # Kullanıcı sadece kendi siparişlerini görebilir
+    if order.user_id != user.id:
+        return jsonify({"msg": "Bu siparişi görüntüleme yetkiniz yok"}), 403
+    
+    return jsonify(format_order_response(order))
+
+# ========== YENİ: SİPARİŞ DURUM GÜNCELLEMESİ (TOKENSIZ) ==========
+@app.route("/admin/orders/<int:order_id>/status", methods=["PATCH", "PUT"])
+def update_order_status(order_id):
+    """Bu endpoint artık **tokensız** — siparişin durumunu günceller (new -> yolda -> teslim_edildi/teslim_edilemedi)"""
+    data = request.json or {}
+    
+    if "status" not in data:
+        return jsonify({"msg": "status gerekli"}), 400
+    
+    new_status = data["status"]
+    valid_statuses = ["new", "yolda", "teslim_edildi", "teslim_edilemedi"]
+    
+    if new_status not in valid_statuses:
+        return jsonify({
+            "msg": f"Geçersiz status. Geçerli değerler: {', '.join(valid_statuses)}"
+        }), 400
+    
+    order = Order.query.get_or_404(order_id)
+    old_status = order.status
+    order.status = new_status
+    order.updated_at = datetime.utcnow()
+    db.session.commit()
+    
+    # Kullanıcıya bildirim gönder
+    user = order.user
+    user_tokens = [dt.token for dt in user.device_tokens]
+    
+    if user_tokens:
+        status_messages = {
+            "yolda": "Siparişiniz yola çıktı",
+            "teslim_edildi": "Siparişiniz teslim edildi",
+            "teslim_edilemedi": "Siparişiniz teslim edilemedi"
+        }
+        
+        if new_status in status_messages:
+            title = status_messages[new_status]
+            body = f"#{order.id} numaralı siparişiniz {new_status} durumuna geçti."
+            
+            order_data = {
+                "order_id": str(order.id),
+                "status": new_status,
+                "type": "order_status_update"
+            }
+            
+            admin_keys = [a.fcm_server_key for a in User.query.filter_by(role="admin").all() if a.fcm_server_key]
+            
+            notify_result = send_fcm_notification(
+                user_tokens,
+                title,
+                body,
+                data=order_data,
+                fallback_server_keys=admin_keys
+            )
+            app.logger.info(f"Sipariş #{order_id} durum bildirimi gönderildi: {notify_result}")
+    
+    app.logger.info(f"Sipariş #{order_id} durumu güncellendi: {old_status} -> {new_status}")
+    
+    return jsonify({
+        "msg": "Sipariş durumu güncellendi",
+        "order": format_order_response(order)
+    })
+
+# ========== HARICI API İÇİN SİPARİŞ DURUM GÜNCELLEMESİ ==========
+@app.route("/api/orders/<int:order_id>/status", methods=["PATCH", "PUT"])
+def external_update_order_status(order_id):
+    """
+    Harici API'den sipariş durumu güncellemesi için endpoint
+    Basit API key authentication kullanır
+    """
+    # API key kontrolü
+    api_key = request.headers.get("X-API-Key") or request.args.get("api_key")
+    expected_key = os.environ.get("EXTERNAL_API_KEY", "your-secret-api-key-here")
+    
+    if not api_key or api_key != expected_key:
+        return jsonify({"msg": "Geçersiz veya eksik API key"}), 401
+    
+    data = request.json or {}
+    
+    if "status" not in data:
+        return jsonify({"msg": "status gerekli"}), 400
+    
+    new_status = data["status"]
+    valid_statuses = ["new", "yolda", "teslim_edildi", "teslim_edilemedi"]
+    
+    if new_status not in valid_statuses:
+        return jsonify({
+            "msg": f"Geçersiz status. Geçerli değerler: {', '.join(valid_statuses)}"
+        }), 400
+    
+    order = Order.query.get_or_404(order_id)
+    old_status = order.status
+    order.status = new_status
+    order.updated_at = datetime.utcnow()
+    db.session.commit()
+    
+    # Kullanıcıya bildirim gönder
+    user = order.user
+    user_tokens = [dt.token for dt in user.device_tokens]
+    
+    # Admin'e de bildirim gönderelim
+    admins = User.query.filter_by(role="admin").all()
+    admin_tokens = [dt.token for a in admins for dt in a.device_tokens]
+    admin_keys = [a.fcm_server_key for a in admins if a.fcm_server_key]
+    
+    if user_tokens:
+        status_messages = {
+            "yolda": "Siparişiniz yola çıktı",
+            "teslim_edildi": "Siparişiniz teslim edildi",
+            "teslim_edilemedi": "Siparişiniz teslim edilemedi"
+        }
+        
+        if new_status in status_messages:
+            title = status_messages[new_status]
+            body = f"#{order.id} numaralı siparişiniz {new_status} durumuna geçti."
+            
+            order_data = {
+                "order_id": str(order.id),
+                "status": new_status,
+                "type": "order_status_update"
+            }
+            
+            notify_result = send_fcm_notification(
+                user_tokens,
+                title,
+                body,
+                data=order_data,
+                fallback_server_keys=admin_keys
+            )
+            app.logger.info(f"[EXTERNAL API] Sipariş #{order_id} durum bildirimi gönderildi: {notify_result}")
+    
+    # Admin'lere bilgi bildirimi
+    if admin_tokens and new_status in ["teslim_edildi", "teslim_edilemedi"]:
+        admin_title = f"Sipariş #{order.id} - {new_status.replace('_', ' ').title()}"
+        admin_body = f"{user.name} {user.surname}'in siparişi {new_status} olarak işaretlendi."
+        
+        send_fcm_notification(
+            admin_tokens,
+            admin_title,
+            admin_body,
+            data={"order_id": str(order.id), "status": new_status, "type": "order_status_update"},
+            fallback_server_keys=admin_keys
+        )
+    
+    app.logger.info(f"[EXTERNAL API] Sipariş #{order_id} durumu güncellendi: {old_status} -> {new_status}")
+    
+    return jsonify({
+        "success": True,
+        "msg": "Sipariş durumu güncellendi",
+        "order": format_order_response(order)
+    })
+
+# Admin orders (Mevcut + Geliştirilmiş)
 @app.route("/admin/orders", methods=["GET"])
 @admin_required
 def admin_orders():
-    orders = Order.query.order_by(Order.created_at.desc()).all()
-    out = []
-    for o in orders:
-        out.append({
-            "id": o.id,
-            "user_id": o.user_id,
-            "total_amount": str(o.total_amount),
-            "status": o.status,
-            "payment_method": o.payment_method,
-            "created_at": o.created_at.isoformat(),
-            "items": [{"product_id": it.product_id, "title": it.product.title, "quantity": it.quantity, "unit_price": str(it.unit_price)} for it in o.items]
-        })
-    return jsonify(out)
+    """Admin tüm siparişleri listeler"""
+    status = request.args.get("status")  # Filtreleme için
+    page = request.args.get("page", default=1, type=int)
+    per_page = request.args.get("per_page", default=50, type=int)
+    
+    if per_page > 100:
+        per_page = 100
+    
+    query = Order.query
+    
+    if status:
+        query = query.filter_by(status=status)
+    
+    query = query.order_by(Order.created_at.desc())
+    
+    total = query.count()
+    total_pages = (total + per_page - 1) // per_page if per_page else 1
+    orders = query.offset((page - 1) * per_page).limit(per_page).all()
+    
+    return jsonify({
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+        "orders": [format_order_response(o) for o in orders]
+    })
 
-# Announcements - YENİ EKLENDİ
+@app.route("/admin/orders/<int:order_id>", methods=["GET"])
+@admin_required
+def admin_order_detail(order_id):
+    """Admin belirli bir siparişin detayını görüntüler"""
+    order = Order.query.get_or_404(order_id)
+    return jsonify(format_order_response(order))
+
+# Announcements
 @app.route("/announcements", methods=["GET"])
 @jwt_required()
 def get_announcements():
@@ -1065,7 +1323,7 @@ def get_announcements():
         "total_pages": announcements.pages
     })
 
-# Admin announce - GELİŞTİRİLMİŞ (DUYURU KAYDI EKLENDİ)
+# Admin announce
 @app.route("/admin/announce", methods=["POST"])
 @admin_required
 def admin_announce():
@@ -1132,22 +1390,36 @@ def admin_summary():
     total_orders = Order.query.count()
     total_users = User.query.filter_by(role="user").count()
     total_announcements = Announcement.query.count()
+    
+    # Durum bazlı sipariş sayıları
+    orders_new = Order.query.filter_by(status="new").count()
+    orders_yolda = Order.query.filter_by(status="yolda").count()
+    orders_teslim_edildi = Order.query.filter_by(status="teslim_edildi").count()
+    orders_teslim_edilemedi = Order.query.filter_by(status="teslim_edilemedi").count()
+    
     total_income_val = 0.0
-    for o in Order.query.all():
+    for o in Order.query.filter_by(status="teslim_edildi").all():
         try:
             total_income_val += float(str(o.total_amount).replace(",", "."))
         except Exception:
             pass
     total_income_str = f"{round(total_income_val,2):.2f}"
+    
     return jsonify({
         "total_products": total_products,
         "total_orders": total_orders,
         "total_users": total_users,
         "total_announcements": total_announcements,
-        "total_income": total_income_str
+        "total_income": total_income_str,
+        "order_status": {
+            "new": orders_new,
+            "yolda": orders_yolda,
+            "teslim_edildi": orders_teslim_edildi,
+            "teslim_edilemedi": orders_teslim_edilemedi
+        }
     })
 
-# User profile - GÜNCELLENDİ (PATCH EKLENDİ)
+# User profile
 @app.route("/me", methods=["GET"])
 @jwt_required()
 def get_me():
@@ -1212,7 +1484,6 @@ def update_me():
 
     return jsonify(response)
 
-# YENİ: Kullanıcı için PATCH endpoint'i
 @app.route("/me", methods=["PATCH"])
 @jwt_required()
 def patch_me():
@@ -1263,7 +1534,6 @@ def patch_me():
 
     return jsonify(response)
 
-# YENİ: Admin profil güncelleme (PATCH)
 @app.route("/admin/me", methods=["PATCH"])
 @admin_required
 def patch_admin_me():
