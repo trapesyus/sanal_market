@@ -8,6 +8,7 @@ import requests
 import importlib.util
 from functools import wraps
 from datetime import datetime, timedelta
+from io import BytesIO
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
@@ -17,6 +18,13 @@ from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
 from sqlalchemy import or_, func, cast, Float, text
+
+# Pillow for thumbnail generation (optional)
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
 
 # Try import firebase_admin (preferred)
 try:
@@ -52,57 +60,138 @@ app.logger.setLevel(logging.INFO)
 app.logger.addHandler(file_handler)
 app.logger.addHandler(logging.StreamHandler())
 
-# ---------- Database Setup ----------
-def setup_database():
-    """Veritabanı tablolarını ve gerekli sütunları oluştur"""
+# ---------- Helpers for images (thumbnail) ----------
+THUMB_MAX_SIZE = (300, 300)  # thumbnail max size (pixels) - adjust as needed
+
+def _b64_to_bytes(b64_str):
     try:
-        with app.app_context():
-            # Temel tabloları oluştur
-            db.create_all()
-            
-            # Eksik sütunları kontrol et ve ekle
-            with db.engine.connect() as conn:
-                # product tablosunda image_base64 sütunu var mı kontrol et
-                result = conn.execute(text("PRAGMA table_info(product)"))
-                columns = [row[1] for row in result]
-                
-                if 'image_base64' not in columns:
-                    app.logger.info("image_base64 sütunu ekleniyor...")
-                    conn.execute(text("ALTER TABLE product ADD COLUMN image_base64 TEXT"))
-                
-                if 'image_mime' not in columns:
-                    app.logger.info("image_mime sütunu ekleniyor...")
-                    conn.execute(text("ALTER TABLE product ADD COLUMN image_mime VARCHAR(80)"))
-                
-                # announcements tablosu var mı kontrol et
-                result = conn.execute(text("SELECT name FROM sqlite_master WHERE type='table' AND name='announcement'"))
-                if not result.fetchone():
-                    app.logger.info("announcements tablosu oluşturuluyor...")
-                    conn.execute(text("""
-                        CREATE TABLE announcement (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            title VARCHAR(200) NOT NULL,
-                            body TEXT NOT NULL,
-                            admin_id INTEGER NOT NULL,
-                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                            FOREIGN KEY (admin_id) REFERENCES user (id)
-                        )
-                    """))
-                
-                # order tablosunda delivery_address sütunu var mı kontrol et
-                result = conn.execute(text("PRAGMA table_info('order')"))
-                columns = [row[1] for row in result]
-                
-                if 'delivery_address' not in columns:
-                    app.logger.info("delivery_address sütunu ekleniyor...")
-                    conn.execute(text("ALTER TABLE 'order' ADD COLUMN delivery_address TEXT"))
-                
-                conn.commit()
-            
-            app.logger.info("Veritabanı başarıyla kuruldu ve güncellendi")
-            
+        return base64.b64decode(b64_str)
+    except Exception:
+        return None
+
+def _bytes_to_b64(bts):
+    try:
+        return base64.b64encode(bts).decode("utf-8")
+    except Exception:
+        return None
+
+def generate_thumbnail_from_base64(b64_str, mime=None, size=THUMB_MAX_SIZE):
+    """
+    Returns (thumb_b64, thumb_mime) or (None, None) on failure.
+    Uses Pillow if available; otherwise attempts a naive resize using PIL not available -> returns original.
+    """
+    if not b64_str:
+        return None, None
+    raw = _b64_to_bytes(b64_str)
+    if raw is None:
+        return None, None
+    if not PIL_AVAILABLE:
+        # Pillow not available: cannot resize reliably — return original as "thumbnail"
+        return b64_str, mime
+    try:
+        with BytesIO(raw) as bio:
+            img = Image.open(bio)
+            img.convert("RGB")
+            img.thumbnail(size, Image.LANCZOS)
+            out = BytesIO()
+            # choose format based on mime or original
+            fmt = None
+            if mime:
+                if "png" in mime.lower():
+                    fmt = "PNG"
+                elif "gif" in mime.lower():
+                    fmt = "GIF"
+                else:
+                    fmt = "JPEG"
+            else:
+                fmt = "JPEG"
+            if fmt == "JPEG":
+                img.save(out, format=fmt, quality=75, optimize=True)
+                out_mime = "image/jpeg"
+            elif fmt == "PNG":
+                img.save(out, format=fmt, optimize=True)
+                out_mime = "image/png"
+            elif fmt == "GIF":
+                img.save(out, format=fmt)
+                out_mime = "image/gif"
+            else:
+                img.save(out, format="JPEG", quality=75, optimize=True)
+                out_mime = "image/jpeg"
+            return _bytes_to_b64(out.getvalue()), out_mime
     except Exception as e:
-        app.logger.error(f"Veritabanı kurulum hatası: {e}")
+        app.logger.exception(f"generate_thumbnail_from_base64 hata: {e}")
+        return None, None
+
+def _file_storage_to_base64(file_storage):
+    data = file_storage.read()
+    try:
+        file_storage.stream.seek(0)
+    except Exception:
+        pass
+    b64 = base64.b64encode(data).decode("utf-8")
+    filename = getattr(file_storage, "filename", "") or ""
+    mime = None
+    if "." in filename:
+        ext = filename.rsplit(".", 1)[1].lower()
+        if ext in ("jpg", "jpeg"):
+            mime = "image/jpeg"
+        elif ext == "png":
+            mime = "image/png"
+        elif ext == "gif":
+            mime = "image/gif"
+    return b64, mime
+
+# ---------- Utility helpers ----------
+def _is_numeric_string(s):
+    try:
+        float(str(s).replace(",", "."))
+        return True
+    except Exception:
+        return False
+
+def _parse_stock_value(s):
+    if s is None or s == "":
+        return 0
+    if isinstance(s, int):
+        return s
+    try:
+        val = float(str(s).replace(",", "."))
+        return int(val)
+    except Exception:
+        raise ValueError("stock integer formatında olmalı (örn. '10')")
+
+# ---------- Firebase / FCM Setup ----------
+SERVICE_ACCOUNT_PATH = "/root/perem-sa-new.json"  # as requested
+firebase_app = None
+
+if FIREBASE_AVAILABLE:
+    try:
+        if os.path.exists(SERVICE_ACCOUNT_PATH):
+            with open(SERVICE_ACCOUNT_PATH, "r", encoding="utf-8") as f:
+                key_data = json.load(f)
+            # fix newline escape if present
+            if "private_key" in key_data and "\\n" in key_data["private_key"]:
+                key_data["private_key"] = key_data["private_key"].replace("\\n", "\n")
+            required = ["type", "project_id", "private_key_id", "private_key", "client_email"]
+            missing = [r for r in required if r not in key_data]
+            if missing:
+                app.logger.error(f"Service account eksik alanlar: {missing} — Firebase devre dışı")
+                firebase_app = None
+            elif key_data.get("type") != "service_account":
+                app.logger.error(f"Service account tipi beklenmiyor: {key_data.get('type')} — Firebase devre dışı")
+                firebase_app = None
+            else:
+                cred = credentials.Certificate(key_data)
+                firebase_app = firebase_admin.initialize_app(cred)
+                app.logger.info("Firebase Admin SDK başarıyla başlatıldı.")
+        else:
+            app.logger.warning(f"Firebase service account bulunamadı: {SERVICE_ACCOUNT_PATH} — Firebase devre dışı")
+            firebase_app = None
+    except Exception as e:
+        app.logger.exception(f"Firebase init hatası: {e}")
+        firebase_app = None
+else:
+    app.logger.warning("firebase_admin yüklü değil — Firebase FCM devre dışı")
 
 # ---------- Models ----------
 class User(db.Model):
@@ -141,8 +230,11 @@ class Product(db.Model):
     description = db.Column(db.Text)
     price = db.Column(db.String(64), nullable=False)   # string per requirement
     stock = db.Column(db.Integer, default=0)           # stored as int internally
-    image_base64 = db.Column(db.Text, nullable=True)   # Resim base64 formatında
-    image_mime = db.Column(db.String(80), nullable=True) # Resim MIME type
+    image_base64 = db.Column(db.Text, nullable=True)   # Resim base64 formatında (thumbnail returned in this field)
+    image_mime = db.Column(db.String(80), nullable=True) # Resim MIME type for image_base64
+    # Store original image separately to keep both versions
+    image_original_base64 = db.Column(db.Text, nullable=True)
+    image_original_mime = db.Column(db.String(80), nullable=True)
     category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
     discount_percent = db.Column(db.String(64), default="0")  # string percent
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -206,89 +298,28 @@ class Announcement(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     admin = db.relationship("User")
 
-# ---------- Helpers ----------
-def admin_required(fn):
-    @wraps(fn)
-    @jwt_required()
-    def wrapper(*args, **kwargs):
-        current = get_jwt_identity()
-        user = User.query.filter_by(username=current).first()
-        if not user or user.role != "admin":
-            return jsonify({"msg": "Admin yetkisi gerekli"}), 403
-        return fn(*args, **kwargs)
-    return wrapper
-
-def _file_storage_to_base64(file_storage):
-    data = file_storage.read()
+# ---------- Database Setup Function ----------
+def setup_database():
+    """Create tables and ensure columns exist (safe ALTERs)."""
     try:
-        file_storage.stream.seek(0)
-    except Exception:
-        pass
-    b64 = base64.b64encode(data).decode("utf-8")
-    filename = getattr(file_storage, "filename", "") or ""
-    mime = None
-    if "." in filename:
-        ext = filename.rsplit(".", 1)[1].lower()
-        if ext in ("jpg", "jpeg"):
-            mime = "image/jpeg"
-        elif ext == "png":
-            mime = "image/png"
-        elif ext == "gif":
-            mime = "image/gif"
-    return b64, mime
-
-def _is_numeric_string(s):
-    try:
-        float(str(s).replace(",", "."))
-        return True
-    except Exception:
-        return False
-
-def _parse_stock_value(s):
-    if s is None or s == "":
-        return 0
-    if isinstance(s, int):
-        return s
-    try:
-        val = float(str(s).replace(",", "."))
-        return int(val)
-    except Exception:
-        raise ValueError("stock integer formatında olmalı (örn. '10')")
-
-# ---------- Firebase / FCM Setup ----------
-SERVICE_ACCOUNT_PATH = "/root/perem-sa-new.json"  # as requested
-firebase_app = None
-
-if FIREBASE_AVAILABLE:
-    try:
-        if os.path.exists(SERVICE_ACCOUNT_PATH):
-            with open(SERVICE_ACCOUNT_PATH, "r", encoding="utf-8") as f:
-                key_data = json.load(f)
-            # fix newline escape if present
-            if "private_key" in key_data and "\\n" in key_data["private_key"]:
-                key_data["private_key"] = key_data["private_key"].replace("\\n", "\n")
-            required = ["type", "project_id", "private_key_id", "private_key", "client_email"]
-            missing = [r for r in required if r not in key_data]
-            if missing:
-                app.logger.error(f"Service account eksik alanlar: {missing} — Firebase devre dışı")
-                firebase_app = None
-            elif key_data.get("type") != "service_account":
-                app.logger.error(f"Service account tipi beklenmiyor: {key_data.get('type')} — Firebase devre dışı")
-                firebase_app = None
-            else:
-                cred = credentials.Certificate(key_data)
-                firebase_app = firebase_admin.initialize_app(cred)
-                app.logger.info("Firebase Admin SDK başarıyla başlatıldı.")
-        else:
-            app.logger.warning(f"Firebase service account bulunamadı: {SERVICE_ACCOUNT_PATH} — Firebase devre dışı")
-            firebase_app = None
+        with app.app_context():
+            db.create_all()
+            with db.engine.connect() as conn:
+                # Check product columns
+                result = conn.execute(text("PRAGMA table_info(product)"))
+                columns = [row[1] for row in result]
+                # If original fields missing, add them
+                if 'image_original_base64' not in columns:
+                    app.logger.info("image_original_base64 sütunu ekleniyor...")
+                    conn.execute(text("ALTER TABLE product ADD COLUMN image_original_base64 TEXT"))
+                if 'image_original_mime' not in columns:
+                    app.logger.info("image_original_mime sütunu ekleniyor...")
+                    conn.execute(text("ALTER TABLE product ADD COLUMN image_original_mime VARCHAR(80)"))
+                conn.commit()
     except Exception as e:
-        app.logger.exception(f"Firebase init hatası: {e}")
-        firebase_app = None
-else:
-    app.logger.warning("firebase_admin yüklü değil — Firebase FCM devre dışı")
+        app.logger.exception(f"setup_database hata: {e}")
 
-# helper chunk
+# ---------- Helpers (FCM) ----------
 def _chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
@@ -435,6 +466,29 @@ def validate_fcm_token(fcm_token):
         # Beklenmeyen hatalarda token'ı kabul et
         return True
 
+# ---------- Formatters ----------
+def format_product_for_response(p: Product):
+    """
+    Return product dict for API responses.
+    IMPORTANT: per user's request, image_base64 field will carry the thumbnail (small image)
+    if thumbnail is available (generated on upload). The original is preserved in
+    image_original_base64 / image_original_mime but not sent by default.
+    """
+    thumb = p.image_base64
+    mime = p.image_mime
+    return {
+        "id": p.id,
+        "title": p.title,
+        "description": p.description,
+        "price": str(p.price),
+        "price_after_discount": p.price_after_discount,
+        "stock": str(p.stock),
+        "image_base64": thumb,
+        "image_mime": mime,
+        "category": p.category.name if p.category else None,
+        "discount_percent": str(p.discount_percent)
+    }
+
 def format_order_response(order):
     """Sipariş nesnesini JSON formatında döndür"""
     return {
@@ -458,6 +512,18 @@ def format_order_response(order):
             "subtotal": f"{float(str(it.unit_price).replace(',', '.')) * it.quantity:.2f}"
         } for it in order.items]
     }
+
+# ---------- Decorators ----------
+def admin_required(fn):
+    @wraps(fn)
+    @jwt_required()
+    def wrapper(*args, **kwargs):
+        current = get_jwt_identity()
+        user = User.query.filter_by(username=current).first()
+        if not user or user.role != "admin":
+            return jsonify({"msg": "Admin yetkisi gerekli"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
 
 # ---------- Routes ----------
 @app.route("/health")
@@ -625,6 +691,7 @@ def create_product():
         image_base64 = data.get("image_base64")
         image_mime = data.get("image_mime")
         discount_percent_str = data.get("discount_percent", "0")
+        # image could be provided as original base64; we'll generate thumbnail below
     else:
         title = request.form.get("title")
         price_str = request.form.get("price")
@@ -665,9 +732,23 @@ def create_product():
             p.category_id = int(category_id)
         except Exception:
             pass
+
+    # If image_base64 present, store original and generate thumbnail; store thumbnail into image_base64 field (per user's request)
     if image_base64:
-        p.image_base64 = image_base64
-        p.image_mime = image_mime
+        # store original
+        p.image_original_base64 = image_base64
+        p.image_original_mime = image_mime
+
+        # generate thumbnail
+        thumb_b64, thumb_mime = generate_thumbnail_from_base64(image_base64, image_mime)
+        if thumb_b64:
+            p.image_base64 = thumb_b64
+            p.image_mime = thumb_mime
+        else:
+            # If thumbnail generation failed, fall back to storing original into image_base64
+            p.image_base64 = image_base64
+            p.image_mime = image_mime
+
     db.session.add(p)
     db.session.commit()
 
@@ -712,8 +793,19 @@ def update_product(product_id):
                     return jsonify({"msg": "discount_percent numeric stringında olmalı"}), 400
                 p.discount_percent = str(dp)
         if "image_base64" in data:
-            p.image_base64 = data.get("image_base64")
-            p.image_mime = data.get("image_mime")
+            # client provided a new image (likely original) - treat as original and generate thumb
+            new_orig_b64 = data.get("image_base64")
+            new_orig_mime = data.get("image_mime")
+            if new_orig_b64:
+                p.image_original_base64 = new_orig_b64
+                p.image_original_mime = new_orig_mime
+                thumb_b64, thumb_mime = generate_thumbnail_from_base64(new_orig_b64, new_orig_mime)
+                if thumb_b64:
+                    p.image_base64 = thumb_b64
+                    p.image_mime = thumb_mime
+                else:
+                    p.image_base64 = new_orig_b64
+                    p.image_mime = new_orig_mime
     else:
         data = request.form or {}
         if "title" in data: p.title = data["title"]
@@ -739,8 +831,16 @@ def update_product(product_id):
         if "image" in request.files:
             file = request.files["image"]
             b64, mime = _file_storage_to_base64(file)
-            p.image_base64 = b64
-            p.image_mime = mime
+            if b64:
+                p.image_original_base64 = b64
+                p.image_original_mime = mime
+                thumb_b64, thumb_mime = generate_thumbnail_from_base64(b64, mime)
+                if thumb_b64:
+                    p.image_base64 = thumb_b64
+                    p.image_mime = thumb_mime
+                else:
+                    p.image_base64 = b64
+                    p.image_mime = mime
 
     db.session.commit()
 
@@ -826,20 +926,7 @@ def list_products():
     total_pages = (total + per_page - 1) // per_page if per_page else 1
     items = q.offset((page - 1) * per_page).limit(per_page).all()
 
-    out = []
-    for p in items:
-        out.append({
-            "id": p.id,
-            "title": p.title,
-            "description": p.description,
-            "price": str(p.price),
-            "price_after_discount": p.price_after_discount,
-            "stock": str(p.stock),
-            "image_base64": p.image_base64,
-            "image_mime": p.image_mime,
-            "category": p.category.name if p.category else None,
-            "discount_percent": str(p.discount_percent)
-        })
+    out = [format_product_for_response(p) for p in items]
 
     return jsonify({
         "total": total,
@@ -860,15 +947,7 @@ def get_cart():
     for it in items:
         out.append({
             "id": it.id,
-            "product": {
-                "id": it.product.id,
-                "title": it.product.title,
-                "price": str(it.product.price),
-                "price_after_discount": it.product.price_after_discount,
-                "stock": str(it.product.stock),
-                "image_base64": it.product.image_base64,
-                "image_mime": it.product.image_mime
-            },
+            "product": format_product_for_response(it.product),
             "quantity": it.quantity
         })
     return jsonify(out)
@@ -945,15 +1024,7 @@ def update_cart_item(cart_item_id):
 
     out = {
         "id": item.id,
-        "product": {
-            "id": product.id,
-            "title": product.title,
-            "price": str(product.price),
-            "price_after_discount": product.price_after_discount,
-            "stock": str(product.stock),
-            "image_base64": product.image_base64,
-            "image_mime": product.image_mime
-        },
+        "product": format_product_for_response(product),
         "quantity": item.quantity
     }
     return jsonify({"msg": "Sepet güncellendi", "cart_item": out})
@@ -1295,7 +1366,6 @@ def admin_order_detail(order_id):
     return jsonify(format_order_response(order))
 
 # ========== YENİ: DUYURULAR İÇİN GELİŞTİRİLMİŞ ENDPOINT'LER ==========
-
 @app.route("/announcements", methods=["GET"])
 @jwt_required()
 def get_announcements():
