@@ -12,7 +12,6 @@ from io import BytesIO
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
-from flask_migrate import Migrate
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
@@ -41,13 +40,12 @@ UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(BASE_DIR, "app.db")
+app.config["SQLALCHEMY_DATABASE_URI"] = "duckdb:///" + os.path.join(BASE_DIR, "app.duckdb")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "change-this-secret")
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 db = SQLAlchemy(app)
-migrate = Migrate(app, db)
 jwt = JWTManager(app)
 
 # ---------- Logging ----------
@@ -305,9 +303,14 @@ def setup_database():
         with app.app_context():
             db.create_all()
             with db.engine.connect() as conn:
-                # Check product columns
-                result = conn.execute(text("PRAGMA table_info(product)"))
-                columns = [row[1] for row in result]
+                # Check product columns - DuckDB için farklı sorgu
+                result = conn.execute(text("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'product'
+                """))
+                columns = [row[0] for row in result]
+                
                 # If original fields missing, add them
                 if 'image_original_base64' not in columns:
                     app.logger.info("image_original_base64 sütunu ekleniyor...")
