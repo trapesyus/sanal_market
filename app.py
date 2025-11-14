@@ -1010,7 +1010,8 @@ def update_product(product_id):
 
     if request.is_json:
         data = request.get_json()
-        if "title" in data: p.title = data.get("title")
+        if "title" in data: 
+            p.title = data.get("title")
         if "price" in data:
             price_str = data.get("price")
             if price_str is not None:
@@ -1022,22 +1023,38 @@ def update_product(product_id):
                 p.stock = _parse_stock_value(data.get("stock"))
             except ValueError as e:
                 return jsonify({"msg": str(e)}), 400
-        if "description" in data: p.description = data.get("description")
+        if "description" in data: 
+            p.description = data.get("description")
         if "category_id" in data:
             try:
                 p.category_id = int(data.get("category_id"))
             except:
-                pass
+                p.category_id = None
         if "discount_percent" in data:
             dp = data.get("discount_percent")
             if dp is not None:
                 if not _is_numeric_string(dp):
                     return jsonify({"msg": "discount_percent numeric stringında olmalı"}), 400
                 p.discount_percent = str(dp)
+        
+        # Resim güncelleme - artık zorunlu değil
         if "image_base64" in data:
-            filename = save_base64_image(data.get("image_base64"))
-            if filename:
-                # Eski resmi sil
+            image_data = data.get("image_base64")
+            if image_data is not None and image_data != "":
+                # Yeni resim var, kaydet
+                filename = save_base64_image(image_data)
+                if filename:
+                    # Eski resmi sil
+                    if p.image_filename:
+                        try:
+                            old_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
+                            if os.path.exists(old_path):
+                                os.remove(old_path)
+                        except Exception as e:
+                            app.logger.warning(f"Eski resim silinemedi: {e}")
+                    p.image_filename = filename
+            else:
+                # Boş string veya null geldiyse, resmi kaldır
                 if p.image_filename:
                     try:
                         old_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
@@ -1045,10 +1062,12 @@ def update_product(product_id):
                             os.remove(old_path)
                     except Exception as e:
                         app.logger.warning(f"Eski resim silinemedi: {e}")
-                p.image_filename = filename
+                p.image_filename = None
+
     else:
         data = request.form or {}
-        if "title" in data: p.title = data["title"]
+        if "title" in data: 
+            p.title = data["title"]
         if "price" in data:
             price_str = data["price"]
             if not _is_numeric_string(price_str):
@@ -1059,30 +1078,34 @@ def update_product(product_id):
                 p.stock = _parse_stock_value(data["stock"])
             except ValueError as e:
                 return jsonify({"msg": str(e)}), 400
-        if "description" in data: p.description = data["description"]
+        if "description" in data: 
+            p.description = data["description"]
         if "category_id" in data:
             try:
                 p.category_id = int(data["category_id"])
             except:
-                pass
+                p.category_id = None
         if "discount_percent" in data:
             dp = data["discount_percent"]
             if not _is_numeric_string(dp):
                 return jsonify({"msg": "discount_percent numeric stringında olmalı"}), 400
             p.discount_percent = str(dp)
+        
+        # Resim güncelleme - artık zorunlu değil
         if "image" in request.files:
             file = request.files["image"]
-            filename = save_uploaded_file(file)
-            if filename:
-                # Eski resmi sil
-                if p.image_filename:
-                    try:
-                        old_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
-                        if os.path.exists(old_path):
-                            os.remove(old_path)
-                    except Exception as e:
-                        app.logger.warning(f"Eski resim silinemedi: {e}")
-                p.image_filename = filename
+            if file and file.filename:  # Dosya var ve boş değilse
+                filename = save_uploaded_file(file)
+                if filename:
+                    # Eski resmi sil
+                    if p.image_filename:
+                        try:
+                            old_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
+                            if os.path.exists(old_path):
+                                os.remove(old_path)
+                        except Exception as e:
+                            app.logger.warning(f"Eski resim silinemedi: {e}")
+                    p.image_filename = filename
 
     db.session.commit()
 
