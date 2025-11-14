@@ -8,31 +8,23 @@ import requests
 import importlib.util
 from functools import wraps
 from datetime import datetime, timedelta
-from io import BytesIO
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
 from sqlalchemy import or_, func, cast, Float, text
 
-# Pillow for thumbnail generation (optional)
+# Try optional DuckDB-related imports to give earlier warning if missing
+DUCKDB_AVAILABLE = True
 try:
-    from PIL import Image
-    PIL_AVAILABLE = True
+    import duckdb  # noqa: F401
+    import duckdb_engine  # noqa: F401
 except Exception:
-    PIL_AVAILABLE = False
-
-# Try import firebase_admin (preferred)
-try:
-    import firebase_admin
-    from firebase_admin import credentials, messaging
-    from firebase_admin.exceptions import FirebaseError
-    FIREBASE_AVAILABLE = True
-except Exception:
-    FIREBASE_AVAILABLE = False
+    DUCKDB_AVAILABLE = False
 
 # ---------- Config ----------
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -40,13 +32,40 @@ UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = "duckdb:///" + os.path.join(BASE_DIR, "app.duckdb")
+
+# ---------- Choose DuckDB as backend ----------
+# We will use a file-based DuckDB database at BASE_DIR/app.duckdb.
+# Note: For absolute paths with the duckdb SQLAlchemy URI some tools require
+# 4 slashes (duckdb:////absolute/path). We'll construct the URI carefully.
+DB_FILE = os.path.join(BASE_DIR, "app.duckdb")
+
+def _make_duckdb_uri(path):
+    # If absolute path -> use duckdb://// + stripped leading slash
+    if os.path.isabs(path):
+        return "duckdb:////" + path.lstrip("/")
+    # relative -> duckdb:///relative/path
+    return "duckdb:///" + path
+
+app.config["SQLALCHEMY_DATABASE_URI"] = _make_duckdb_uri(DB_FILE)
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "change-this-secret")
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 db = SQLAlchemy(app)
+migrate = Migrate(app, db)
 jwt = JWTManager(app)
+
+# If duckdb packages weren't available, warn in logs (app exists now).
+if not DUCKDB_AVAILABLE:
+    if not os.path.exists("logs"):
+        os.makedirs("logs", exist_ok=True)
+    # minimal logging to stderr/file
+    lh = logging.getLogger()
+    lh.setLevel(logging.INFO)
+    fh = logging.FileHandler("logs/app.log")
+    fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+    lh.addHandler(fh)
+    lh.warning("duckdb veya duckdb-engine yüklü değil. Lütfen `pip install duckdb duckdb-engine` ile yükleyin. Uygulama yine de başlatılmaya çalışılacak ancak DB sürücüsü eksikse hata alınır.")
 
 # ---------- Logging ----------
 if not os.path.exists("logs"):
@@ -58,67 +77,147 @@ app.logger.setLevel(logging.INFO)
 app.logger.addHandler(file_handler)
 app.logger.addHandler(logging.StreamHandler())
 
-# ---------- Helpers for images (thumbnail) ----------
-THUMB_MAX_SIZE = (300, 300)  # thumbnail max size (pixels) - adjust as needed
-
-def _b64_to_bytes(b64_str):
+# ---------- Database Setup ----------
+def setup_database():
+    """Veritabanı tablolarını oluşturur. (DuckDB backend için drop_all + create_all)"""
     try:
-        return base64.b64decode(b64_str)
-    except Exception:
-        return None
-
-def _bytes_to_b64(bts):
-    try:
-        return base64.b64encode(bts).decode("utf-8")
-    except Exception:
-        return None
-
-def generate_thumbnail_from_base64(b64_str, mime=None, size=THUMB_MAX_SIZE):
-    """
-    Returns (thumb_b64, thumb_mime) or (None, None) on failure.
-    Uses Pillow if available; otherwise attempts a naive resize using PIL not available -> returns original.
-    """
-    if not b64_str:
-        return None, None
-    raw = _b64_to_bytes(b64_str)
-    if raw is None:
-        return None, None
-    if not PIL_AVAILABLE:
-        # Pillow not available: cannot resize reliably — return original as "thumbnail"
-        return b64_str, mime
-    try:
-        with BytesIO(raw) as bio:
-            img = Image.open(bio)
-            img.convert("RGB")
-            img.thumbnail(size, Image.LANCZOS)
-            out = BytesIO()
-            # choose format based on mime or original
-            fmt = None
-            if mime:
-                if "png" in mime.lower():
-                    fmt = "PNG"
-                elif "gif" in mime.lower():
-                    fmt = "GIF"
-                else:
-                    fmt = "JPEG"
-            else:
-                fmt = "JPEG"
-            if fmt == "JPEG":
-                img.save(out, format=fmt, quality=75, optimize=True)
-                out_mime = "image/jpeg"
-            elif fmt == "PNG":
-                img.save(out, format=fmt, optimize=True)
-                out_mime = "image/png"
-            elif fmt == "GIF":
-                img.save(out, format=fmt)
-                out_mime = "image/gif"
-            else:
-                img.save(out, format="JPEG", quality=75, optimize=True)
-                out_mime = "image/jpeg"
-            return _bytes_to_b64(out.getvalue()), out_mime
+        with app.app_context():
+            # Drop all mevcut tabloları kaldır (veriler kaybolur — belirttiğiniz üzere sorun yok).
+            app.logger.info("Veritabanı başlangıç: mevcut tablolar kaldırılıyor ve yeniden oluşturuluyor.")
+            try:
+                db.drop_all()
+            except Exception as e:
+                app.logger.warning(f"db.drop_all sırasında hata: {e} — devam ediliyor.")
+            # Create all tables according to SQLAlchemy modelleri
+            db.create_all()
+            app.logger.info(f"Veritabanı başarıyla kuruldu ve tablolar oluşturuldu. DB URI: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
     except Exception as e:
-        app.logger.exception(f"generate_thumbnail_from_base64 hata: {e}")
-        return None, None
+        app.logger.exception(f"Veritabanı kurulum hatası: {e}")
+
+# ---------- Models ----------
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    email = db.Column(db.String(120), nullable=False)
+    name = db.Column(db.String(80))
+    surname = db.Column(db.String(80))
+    phone = db.Column(db.String(50))
+    address = db.Column(db.Text, nullable=True)
+    role = db.Column(db.String(20), default="user")  # 'user' or 'admin'
+    fcm_server_key = db.Column(db.Text, nullable=True)  # legacy HTTP server key (optional)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    device_tokens = db.relationship("DeviceToken", backref="user", lazy=True)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+
+class DeviceToken(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    token = db.Column(db.String(512), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class Category(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(80), unique=True, nullable=False)
+
+
+class Product(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text)
+    price = db.Column(db.String(64), nullable=False)  # string per requirement
+    stock = db.Column(db.Integer, default=0)  # stored as int internally
+    image_base64 = db.Column(db.Text, nullable=True)  # Resim base64 formatında
+    image_mime = db.Column(db.String(80), nullable=True)  # Resim MIME type
+    category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
+    discount_percent = db.Column(db.String(64), default="0")  # string percent
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    category = db.relationship("Category")
+
+    def _price_float(self):
+        try:
+            return float(self.price.replace(",", ".")) if isinstance(self.price, str) else float(self.price)
+        except Exception:
+            return 0.0
+
+    def _discount_float(self):
+        try:
+            return float(self.discount_percent.replace(",", ".")) if isinstance(self.discount_percent, str) else float(
+                self.discount_percent)
+        except Exception:
+            return 0.0
+
+    @property
+    def price_after_discount(self):
+        p = self._price_float()
+        d = self._discount_float()
+        if d and d > 0:
+            val = round(p * (1 - d / 100), 2)
+        else:
+            val = round(p, 2)
+        return f"{val:.2f}"
+
+
+class CartItem(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey("product.id"), nullable=False)
+    quantity = db.Column(db.Integer, default=1)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    product = db.relationship("Product")
+
+
+class Order(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    total_amount = db.Column(db.String(64), nullable=False)  # string
+    status = db.Column(db.String(50), default="new")  # new, yolda, teslim_edildi, teslim_edilemedi
+    payment_method = db.Column(db.String(50), default="kapida_nakit")
+    delivery_address = db.Column(db.Text, nullable=True)  # Teslimat adresi
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    items = db.relationship("OrderItem", backref="order", lazy=True)
+    user = db.relationship("User", backref="orders")
+
+
+class OrderItem(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey("order.id"), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey("product.id"), nullable=False)
+    quantity = db.Column(db.Integer, nullable=False)
+    unit_price = db.Column(db.String(64), nullable=False)
+    product = db.relationship("Product")
+
+
+class Announcement(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    body = db.Column(db.Text, nullable=False)
+    admin_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    admin = db.relationship("User")
+
+
+# ---------- Helpers ----------
+def admin_required(fn):
+    @wraps(fn)
+    @jwt_required()
+    def wrapper(*args, **kwargs):
+        current = get_jwt_identity()
+        user = User.query.filter_by(username=current).first()
+        if not user or user.role != "admin":
+            return jsonify({"msg": "Admin yetkisi gerekli"}), 403
+        return fn(*args, **kwargs)
+
+    return wrapper
+
 
 def _file_storage_to_base64(file_storage):
     data = file_storage.read()
@@ -139,13 +238,14 @@ def _file_storage_to_base64(file_storage):
             mime = "image/gif"
     return b64, mime
 
-# ---------- Utility helpers ----------
+
 def _is_numeric_string(s):
     try:
         float(str(s).replace(",", "."))
         return True
     except Exception:
         return False
+
 
 def _parse_stock_value(s):
     if s is None or s == "":
@@ -158,9 +258,19 @@ def _parse_stock_value(s):
     except Exception:
         raise ValueError("stock integer formatında olmalı (örn. '10')")
 
+
 # ---------- Firebase / FCM Setup ----------
 SERVICE_ACCOUNT_PATH = "/root/perem-sa-new.json"  # as requested
 firebase_app = None
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, messaging
+    from firebase_admin.exceptions import FirebaseError
+
+    FIREBASE_AVAILABLE = True
+except Exception:
+    FIREBASE_AVAILABLE = False
 
 if FIREBASE_AVAILABLE:
     try:
@@ -191,141 +301,12 @@ if FIREBASE_AVAILABLE:
 else:
     app.logger.warning("firebase_admin yüklü değil — Firebase FCM devre dışı")
 
-# ---------- Models ----------
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(256), nullable=False)
-    email = db.Column(db.String(120), nullable=False)
-    name = db.Column(db.String(80))
-    surname = db.Column(db.String(80))
-    phone = db.Column(db.String(50))
-    address = db.Column(db.Text, nullable=True)
-    role = db.Column(db.String(20), default="user")  # 'user' or 'admin'
-    fcm_server_key = db.Column(db.Text, nullable=True)  # legacy HTTP server key (optional)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    device_tokens = db.relationship("DeviceToken", backref="user", lazy=True)
 
-    def set_password(self, password):
-        self.password_hash = generate_password_hash(password)
-
-    def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
-
-class DeviceToken(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    token = db.Column(db.String(512), nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-
-class Category(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(80), unique=True, nullable=False)
-
-class Product(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(200), nullable=False)
-    description = db.Column(db.Text)
-    price = db.Column(db.String(64), nullable=False)   # string per requirement
-    stock = db.Column(db.Integer, default=0)           # stored as int internally
-    image_base64 = db.Column(db.Text, nullable=True)   # Resim base64 formatında (thumbnail returned in this field)
-    image_mime = db.Column(db.String(80), nullable=True) # Resim MIME type for image_base64
-    # Store original image separately to keep both versions
-    image_original_base64 = db.Column(db.Text, nullable=True)
-    image_original_mime = db.Column(db.String(80), nullable=True)
-    category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
-    discount_percent = db.Column(db.String(64), default="0")  # string percent
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    category = db.relationship("Category")
-
-    def _price_float(self):
-        try:
-            return float(self.price.replace(",", ".")) if isinstance(self.price, str) else float(self.price)
-        except Exception:
-            return 0.0
-
-    def _discount_float(self):
-        try:
-            return float(self.discount_percent.replace(",", ".")) if isinstance(self.discount_percent, str) else float(self.discount_percent)
-        except Exception:
-            return 0.0
-
-    @property
-    def price_after_discount(self):
-        p = self._price_float()
-        d = self._discount_float()
-        if d and d > 0:
-            val = round(p * (1 - d / 100), 2)
-        else:
-            val = round(p, 2)
-        return f"{val:.2f}"
-
-class CartItem(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    product_id = db.Column(db.Integer, db.ForeignKey("product.id"), nullable=False)
-    quantity = db.Column(db.Integer, default=1)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    product = db.relationship("Product")
-
-class Order(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    total_amount = db.Column(db.String(64), nullable=False)  # string
-    status = db.Column(db.String(50), default="new")  # new, yolda, teslim_edildi, teslim_edilemedi
-    payment_method = db.Column(db.String(50), default="kapida_nakit")
-    delivery_address = db.Column(db.Text, nullable=True)  # Teslimat adresi
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    items = db.relationship("OrderItem", backref="order", lazy=True)
-    user = db.relationship("User", backref="orders")
-
-class OrderItem(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    order_id = db.Column(db.Integer, db.ForeignKey("order.id"), nullable=False)
-    product_id = db.Column(db.Integer, db.ForeignKey("product.id"), nullable=False)
-    quantity = db.Column(db.Integer, nullable=False)
-    unit_price = db.Column(db.String(64), nullable=False)
-    product = db.relationship("Product")
-
-class Announcement(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(200), nullable=False)
-    body = db.Column(db.Text, nullable=False)
-    admin_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    admin = db.relationship("User")
-
-# ---------- Database Setup Function ----------
-def setup_database():
-    """Create tables and ensure columns exist (safe ALTERs)."""
-    try:
-        with app.app_context():
-            db.create_all()
-            with db.engine.connect() as conn:
-                # Check product columns - DuckDB için farklı sorgu
-                result = conn.execute(text("""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_name = 'product'
-                """))
-                columns = [row[0] for row in result]
-                
-                # If original fields missing, add them
-                if 'image_original_base64' not in columns:
-                    app.logger.info("image_original_base64 sütunu ekleniyor...")
-                    conn.execute(text("ALTER TABLE product ADD COLUMN image_original_base64 TEXT"))
-                if 'image_original_mime' not in columns:
-                    app.logger.info("image_original_mime sütunu ekleniyor...")
-                    conn.execute(text("ALTER TABLE product ADD COLUMN image_original_mime VARCHAR(80)"))
-                conn.commit()
-    except Exception as e:
-        app.logger.exception(f"setup_database hata: {e}")
-
-# ---------- Helpers (FCM) ----------
+# helper chunk
 def _chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
+
 
 def cleanup_invalid_fcm_token(token):
     try:
@@ -336,6 +317,7 @@ def cleanup_invalid_fcm_token(token):
         app.logger.info(f"Geçersiz token temizlendi: {token[:20]}...")
     except Exception as e:
         app.logger.exception(f"cleanup_invalid_fcm_token hata: {e}")
+
 
 def send_fcm_via_firebase(tokens, title, body, data=None):
     if not firebase_app:
@@ -351,7 +333,8 @@ def send_fcm_via_firebase(tokens, title, body, data=None):
                 notification=messaging.Notification(title=title, body=body),
                 data={k: str(v) for k, v in (data or {}).items()},
                 android=messaging.AndroidConfig(priority="high",
-                                               notification=messaging.AndroidNotification(sound="default", click_action="FLUTTER_NOTIFICATION_CLICK")),
+                                                notification=messaging.AndroidNotification(sound="default",
+                                                                                           click_action="FLUTTER_NOTIFICATION_CLICK")),
                 apns=messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound="default", badge=1)))
             )
             resp = messaging.send_each_for_multicast(message)
@@ -374,6 +357,7 @@ def send_fcm_via_firebase(tokens, title, body, data=None):
         app.logger.exception(f"send_fcm_via_firebase hata: {e}")
         return {"success": False, "error": str(e)}
 
+
 def send_fcm_legacy(server_key, tokens, title, body, data=None):
     if not server_key:
         return {"success": False, "error": "no server_key"}
@@ -393,12 +377,13 @@ def send_fcm_legacy(server_key, tokens, title, body, data=None):
         app.logger.exception(f"send_fcm_legacy hata: {e}")
         return {"success": False, "error": str(e)}
 
+
 def send_fcm_notification(tokens, title, body, data=None, fallback_server_keys=None):
     if not tokens:
         return {"success": False, "error": "no tokens provided"}
-    
+
     app.logger.info(f"FCM gönderiliyor: {len(tokens)} token, başlık: {title}")
-    
+
     # try firebase_admin first
     if firebase_app:
         res = send_fcm_via_firebase(tokens, title, body, data or {})
@@ -407,7 +392,7 @@ def send_fcm_notification(tokens, title, body, data=None, fallback_server_keys=N
             return res
         else:
             app.logger.warning(f"Firebase Admin ile gönderim başarısız: {res.get('error')}")
-    
+
     # fallback with provided keys
     if fallback_server_keys:
         for sk in fallback_server_keys:
@@ -417,22 +402,23 @@ def send_fcm_notification(tokens, title, body, data=None, fallback_server_keys=N
             if res.get("success"):
                 app.logger.info(f"Legacy FCM ile gönderim başarılı: {res.get('status_code')}")
                 return res
-    
+
     # try global env key
     env_key = os.environ.get("GLOBAL_LEGACY_FCM_SERVER_KEY")
     if env_key:
         res = send_fcm_legacy(env_key, tokens, title, body, data or {})
         if res.get("success"):
             return res
-    
+
     app.logger.error("Hiçbir FCM yöntemi çalışmadı")
     return {"success": False, "error": "No working FCM method available"}
+
 
 def validate_fcm_token(fcm_token):
     if not fcm_token:
         app.logger.warning("validate_fcm_token: Token boş")
         return False
-    
+
     # Firebase başlatılmamışsa basit bir format kontrolü yap
     if not firebase_app:
         app.logger.warning("validate_fcm_token: Firebase başlatılmamış, basit kontrol yapılıyor")
@@ -442,11 +428,11 @@ def validate_fcm_token(fcm_token):
         else:
             app.logger.warning(f"validate_fcm_token: Token formatı uygun değil: {fcm_token[:50]}...")
             return False
-    
+
     # Firebase başlatılmışsa dry-run ile test et
     try:
         msg = messaging.Message(
-            token=fcm_token, 
+            token=fcm_token,
             data={"validation": "test"}
         )
         messaging.send(msg, dry_run=True)
@@ -455,7 +441,7 @@ def validate_fcm_token(fcm_token):
     except FirebaseError as e:
         error_str = str(e).lower()
         app.logger.warning(f"validate_fcm_token FirebaseError: {error_str}")
-        
+
         # Geçersiz token hataları
         if any(x in error_str for x in ["unregistered", "not-found", "notregistered", "invalid-argument", "invalid"]):
             app.logger.error(f"validate_fcm_token: Geçersiz token - {error_str}")
@@ -469,28 +455,6 @@ def validate_fcm_token(fcm_token):
         # Beklenmeyen hatalarda token'ı kabul et
         return True
 
-# ---------- Formatters ----------
-def format_product_for_response(p: Product):
-    """
-    Return product dict for API responses.
-    IMPORTANT: per user's request, image_base64 field will carry the thumbnail (small image)
-    if thumbnail is available (generated on upload). The original is preserved in
-    image_original_base64 / image_original_mime but not sent by default.
-    """
-    thumb = p.image_base64
-    mime = p.image_mime
-    return {
-        "id": p.id,
-        "title": p.title,
-        "description": p.description,
-        "price": str(p.price),
-        "price_after_discount": p.price_after_discount,
-        "stock": str(p.stock),
-        "image_base64": thumb,
-        "image_mime": mime,
-        "category": p.category.name if p.category else None,
-        "discount_percent": str(p.discount_percent)
-    }
 
 def format_order_response(order):
     """Sipariş nesnesini JSON formatında döndür"""
@@ -516,22 +480,12 @@ def format_order_response(order):
         } for it in order.items]
     }
 
-# ---------- Decorators ----------
-def admin_required(fn):
-    @wraps(fn)
-    @jwt_required()
-    def wrapper(*args, **kwargs):
-        current = get_jwt_identity()
-        user = User.query.filter_by(username=current).first()
-        if not user or user.role != "admin":
-            return jsonify({"msg": "Admin yetkisi gerekli"}), 403
-        return fn(*args, **kwargs)
-    return wrapper
 
 # ---------- Routes ----------
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
 
 # --- Auth ---
 @app.route("/auth/register_admin", methods=["POST"])
@@ -557,6 +511,7 @@ def register_admin():
     db.session.commit()
     return jsonify({"msg": "Admin oluşturuldu", "admin_id": user.id})
 
+
 @app.route("/auth/register", methods=["POST"])
 def register_user():
     data = request.json or {}
@@ -578,6 +533,7 @@ def register_user():
     db.session.add(user)
     db.session.commit()
     return jsonify({"msg": "Kullanıcı oluşturuldu", "user_id": user.id})
+
 
 @app.route("/auth/login", methods=["POST"])
 def login():
@@ -605,6 +561,7 @@ def login():
 
     return jsonify({"access_token": token, "user": user_info})
 
+
 # Device token registration
 @app.route("/auth/device/register", methods=["POST"])
 @jwt_required()
@@ -612,14 +569,14 @@ def register_device():
     data = request.json or {}
     if "token" not in data:
         return jsonify({"msg": "token gerekli"}), 400
-    
+
     token = data["token"]
     app.logger.info(f"Device token kaydı için gelen token: {token[:50]}...")
-    
+
     # Token validation'ı daha esnek hale getir
     if not token or len(token) < 10:
         return jsonify({"msg": "Token çok kısa veya boş"}), 400
-    
+
     current = get_jwt_identity()
     user = User.query.filter_by(username=current).first()
     if not user:
@@ -634,9 +591,10 @@ def register_device():
     dt = DeviceToken(token=token, user_id=user.id)
     db.session.add(dt)
     db.session.commit()
-    
+
     app.logger.info(f"Device token başarıyla kaydedildi: {token[:50]}...")
     return jsonify({"msg": "Device token kaydedildi"})
+
 
 # Categories
 @app.route("/admin/categories", methods=["POST"])
@@ -652,10 +610,12 @@ def create_category():
     db.session.commit()
     return jsonify({"msg": "Kategori oluşturuldu", "category_id": c.id})
 
+
 @app.route("/categories", methods=["GET"])
 def list_categories():
     cats = Category.query.order_by(Category.name.asc()).all()
     return jsonify([{"id": c.id, "name": c.name} for c in cats])
+
 
 @app.route("/admin/categories/<int:category_id>", methods=["DELETE"])
 @admin_required
@@ -680,6 +640,7 @@ def delete_category(category_id):
     db.session.commit()
     return jsonify({"msg": "Kategori silindi", "category_id": category_id})
 
+
 # Product management
 @app.route("/admin/products", methods=["POST"])
 @admin_required
@@ -694,7 +655,6 @@ def create_product():
         image_base64 = data.get("image_base64")
         image_mime = data.get("image_mime")
         discount_percent_str = data.get("discount_percent", "0")
-        # image could be provided as original base64; we'll generate thumbnail below
     else:
         title = request.form.get("title")
         price_str = request.form.get("price")
@@ -735,23 +695,9 @@ def create_product():
             p.category_id = int(category_id)
         except Exception:
             pass
-
-    # If image_base64 present, store original and generate thumbnail; store thumbnail into image_base64 field (per user's request)
     if image_base64:
-        # store original
-        p.image_original_base64 = image_base64
-        p.image_original_mime = image_mime
-
-        # generate thumbnail
-        thumb_b64, thumb_mime = generate_thumbnail_from_base64(image_base64, image_mime)
-        if thumb_b64:
-            p.image_base64 = thumb_b64
-            p.image_mime = thumb_mime
-        else:
-            # If thumbnail generation failed, fall back to storing original into image_base64
-            p.image_base64 = image_base64
-            p.image_mime = image_mime
-
+        p.image_base64 = image_base64
+        p.image_mime = image_mime
     db.session.add(p)
     db.session.commit()
 
@@ -764,6 +710,7 @@ def create_product():
         pass
 
     return jsonify({"msg": "Ürün oluşturuldu", "product_id": p.id})
+
 
 @app.route("/admin/products/<int:product_id>", methods=["PUT"])
 @admin_required
@@ -787,8 +734,10 @@ def update_product(product_id):
                 return jsonify({"msg": str(e)}), 400
         if "description" in data: p.description = data.get("description")
         if "category_id" in data:
-            try: p.category_id = int(data.get("category_id"))
-            except: pass
+            try:
+                p.category_id = int(data.get("category_id"))
+            except:
+                pass
         if "discount_percent" in data:
             dp = data.get("discount_percent")
             if dp is not None:
@@ -796,19 +745,8 @@ def update_product(product_id):
                     return jsonify({"msg": "discount_percent numeric stringında olmalı"}), 400
                 p.discount_percent = str(dp)
         if "image_base64" in data:
-            # client provided a new image (likely original) - treat as original and generate thumb
-            new_orig_b64 = data.get("image_base64")
-            new_orig_mime = data.get("image_mime")
-            if new_orig_b64:
-                p.image_original_base64 = new_orig_b64
-                p.image_original_mime = new_orig_mime
-                thumb_b64, thumb_mime = generate_thumbnail_from_base64(new_orig_b64, new_orig_mime)
-                if thumb_b64:
-                    p.image_base64 = thumb_b64
-                    p.image_mime = thumb_mime
-                else:
-                    p.image_base64 = new_orig_b64
-                    p.image_mime = new_orig_mime
+            p.image_base64 = data.get("image_base64")
+            p.image_mime = data.get("image_mime")
     else:
         data = request.form or {}
         if "title" in data: p.title = data["title"]
@@ -824,8 +762,10 @@ def update_product(product_id):
                 return jsonify({"msg": str(e)}), 400
         if "description" in data: p.description = data["description"]
         if "category_id" in data:
-            try: p.category_id = int(data["category_id"])
-            except: pass
+            try:
+                p.category_id = int(data["category_id"])
+            except:
+                pass
         if "discount_percent" in data:
             dp = data["discount_percent"]
             if not _is_numeric_string(dp):
@@ -834,16 +774,8 @@ def update_product(product_id):
         if "image" in request.files:
             file = request.files["image"]
             b64, mime = _file_storage_to_base64(file)
-            if b64:
-                p.image_original_base64 = b64
-                p.image_original_mime = mime
-                thumb_b64, thumb_mime = generate_thumbnail_from_base64(b64, mime)
-                if thumb_b64:
-                    p.image_base64 = thumb_b64
-                    p.image_mime = thumb_mime
-                else:
-                    p.image_base64 = b64
-                    p.image_mime = mime
+            p.image_base64 = b64
+            p.image_mime = mime
 
     db.session.commit()
 
@@ -858,6 +790,7 @@ def update_product(product_id):
 
     return jsonify({"msg": "Ürün güncellendi"})
 
+
 @app.route("/admin/products/<int:product_id>", methods=["DELETE"])
 @admin_required
 def delete_product(product_id):
@@ -865,6 +798,7 @@ def delete_product(product_id):
     db.session.delete(p)
     db.session.commit()
     return jsonify({"msg": "Ürün silindi"})
+
 
 @app.route("/admin/products/<int:product_id>/discount", methods=["POST"])
 @admin_required
@@ -881,6 +815,7 @@ def set_discount(product_id):
 
     notify_result = notify_users_about_discount(p)
     return jsonify({"msg": "İndirim uygulandı", "discount_percent": p.discount_percent, "notify_result": notify_result})
+
 
 # Products listing/search
 @app.route("/products", methods=["GET"])
@@ -929,7 +864,20 @@ def list_products():
     total_pages = (total + per_page - 1) // per_page if per_page else 1
     items = q.offset((page - 1) * per_page).limit(per_page).all()
 
-    out = [format_product_for_response(p) for p in items]
+    out = []
+    for p in items:
+        out.append({
+            "id": p.id,
+            "title": p.title,
+            "description": p.description,
+            "price": str(p.price),
+            "price_after_discount": p.price_after_discount,
+            "stock": str(p.stock),
+            "image_base64": p.image_base64,
+            "image_mime": p.image_mime,
+            "category": p.category.name if p.category else None,
+            "discount_percent": str(p.discount_percent)
+        })
 
     return jsonify({
         "total": total,
@@ -938,6 +886,7 @@ def list_products():
         "total_pages": total_pages,
         "products": out
     })
+
 
 # Cart operations
 @app.route("/cart", methods=["GET"])
@@ -950,10 +899,19 @@ def get_cart():
     for it in items:
         out.append({
             "id": it.id,
-            "product": format_product_for_response(it.product),
+            "product": {
+                "id": it.product.id,
+                "title": it.product.title,
+                "price": str(it.product.price),
+                "price_after_discount": it.product.price_after_discount,
+                "stock": str(it.product.stock),
+                "image_base64": it.product.image_base64,
+                "image_mime": it.product.image_mime
+            },
             "quantity": it.quantity
         })
     return jsonify(out)
+
 
 @app.route("/cart", methods=["POST"])
 @jwt_required()
@@ -979,6 +937,7 @@ def add_to_cart():
     db.session.commit()
     return jsonify({"msg": "Sepete eklendi"})
 
+
 @app.route("/cart/remove", methods=["POST"])
 @jwt_required()
 def remove_cart_item():
@@ -989,6 +948,7 @@ def remove_cart_item():
     db.session.delete(item)
     db.session.commit()
     return jsonify({"msg": "Silindi"})
+
 
 # Update cart item quantity (PATCH & PUT)
 @app.route("/cart/<int:cart_item_id>", methods=["PATCH", "PUT"])
@@ -1027,10 +987,19 @@ def update_cart_item(cart_item_id):
 
     out = {
         "id": item.id,
-        "product": format_product_for_response(product),
+        "product": {
+            "id": product.id,
+            "title": product.title,
+            "price": str(product.price),
+            "price_after_discount": product.price_after_discount,
+            "stock": str(product.stock),
+            "image_base64": product.image_base64,
+            "image_mime": product.image_mime
+        },
         "quantity": item.quantity
     }
     return jsonify({"msg": "Sepet güncellendi", "cart_item": out})
+
 
 # Checkout
 @app.route("/cart/checkout", methods=["POST"])
@@ -1039,7 +1008,7 @@ def checkout():
     data = request.json or {}
     payment_method = data.get("payment_method", "kapida_nakit")
     delivery_address = data.get("delivery_address")  # Özel teslimat adresi
-    
+
     if payment_method in ("card_on_delivery", "kapida_kart"):
         payment_method = "kapida_kart"
     else:
@@ -1050,7 +1019,7 @@ def checkout():
     items = CartItem.query.filter_by(user_id=user.id).all()
     if not items:
         return jsonify({"msg": "Sepet boş"}), 400
-    
+
     # Stok kontrolü
     for it in items:
         if it.product.stock < it.quantity:
@@ -1066,24 +1035,25 @@ def checkout():
         total += unit * it.quantity
 
     total_rounded = round(total, 2)
-    
+
     # Teslimat adresini belirle (gönderilmişse özel adresi kullan, yoksa kullanıcı adresini)
     final_address = delivery_address if delivery_address else user.address
-    
+
     # Sipariş oluştur
     order = Order(
-        user_id=user.id, 
-        total_amount=f"{total_rounded:.2f}", 
+        user_id=user.id,
+        total_amount=f"{total_rounded:.2f}",
         payment_method=payment_method,
         delivery_address=final_address
     )
     db.session.add(order)
     db.session.commit()
-    
+
     # Sipariş öğelerini oluştur ve stokları güncelle
     for it in items:
         unit_price_str = it.product.price_after_discount
-        oi = OrderItem(order_id=order.id, product_id=it.product.id, quantity=it.quantity, unit_price=str(unit_price_str))
+        oi = OrderItem(order_id=order.id, product_id=it.product.id, quantity=it.quantity,
+                       unit_price=str(unit_price_str))
         db.session.add(oi)
         it.product.stock -= it.quantity
         db.session.delete(it)
@@ -1093,13 +1063,13 @@ def checkout():
     admins = User.query.filter_by(role="admin").all()
     admin_tokens = [dt.token for a in admins for dt in a.device_tokens]
     admin_keys = [a.fcm_server_key for a in admins if a.fcm_server_key]
-    
+
     app.logger.info(f"Sipariş #{order.id} oluşturuldu. Admin bildirim gönderiliyor...")
-    
+
     if admin_tokens:
         title = "Yeni Sipariş"
         body = f"#{order.id} numaralı sipariş oluşturuldu. Tutar: {order.total_amount} TL. Ödeme: {order.payment_method}"
-        
+
         order_data = {
             "order_id": str(order.id),
             "total_amount": order.total_amount,
@@ -1107,12 +1077,12 @@ def checkout():
             "user_name": f"{user.name} {user.surname}",
             "type": "new_order"
         }
-        
+
         notify_result = send_fcm_notification(
-            admin_tokens, 
-            title, 
-            body, 
-            data=order_data, 
+            admin_tokens,
+            title,
+            body,
+            data=order_data,
             fallback_server_keys=admin_keys
         )
         app.logger.info(f"Admin bildirim sonucu: {notify_result}")
@@ -1120,12 +1090,13 @@ def checkout():
         app.logger.warning("Admin token bulunamadığı için bildirim gönderilmedi")
 
     return jsonify({
-        "msg": "Sipariş oluştu", 
-        "order_id": order.id, 
-        "payment_method": order.payment_method, 
+        "msg": "Sipariş oluştu",
+        "order_id": order.id,
+        "payment_method": order.payment_method,
         "total_amount": order.total_amount,
         "delivery_address": final_address
     })
+
 
 # ========== YENİ: KULLANICI SİPARİŞLERİ ==========
 @app.route("/orders/my", methods=["GET"])
@@ -1134,28 +1105,28 @@ def get_my_orders():
     """Kullanıcın kendi siparişlerini listeler"""
     current = get_jwt_identity()
     user = User.query.filter_by(username=current).first_or_404()
-    
+
     # Filtreleme parametreleri
     status = request.args.get("status")  # new, yolda, teslim_edildi, teslim_edilemedi
     page = request.args.get("page", default=1, type=int)
     per_page = request.args.get("per_page", default=20, type=int)
-    
+
     if per_page > 100:
         per_page = 100
-    
+
     # Sorgu oluştur
     query = Order.query.filter_by(user_id=user.id)
-    
+
     if status:
         query = query.filter_by(status=status)
-    
+
     query = query.order_by(Order.created_at.desc())
-    
+
     # Sayfalama
     total = query.count()
     total_pages = (total + per_page - 1) // per_page if per_page else 1
     orders = query.offset((page - 1) * per_page).limit(per_page).all()
-    
+
     return jsonify({
         "total": total,
         "page": page,
@@ -1164,67 +1135,69 @@ def get_my_orders():
         "orders": [format_order_response(o) for o in orders]
     })
 
+
 @app.route("/orders/my/<int:order_id>", methods=["GET"])
 @jwt_required()
 def get_my_order_detail(order_id):
     """Kullanıcın belirli bir siparişinin detayını getirir"""
     current = get_jwt_identity()
     user = User.query.filter_by(username=current).first_or_404()
-    
+
     order = Order.query.get_or_404(order_id)
-    
+
     # Kullanıcı sadece kendi siparişlerini görebilir
     if order.user_id != user.id:
         return jsonify({"msg": "Bu siparişi görüntüleme yetkiniz yok"}), 403
-    
+
     return jsonify(format_order_response(order))
+
 
 # ========== YENİ: SİPARİŞ DURUM GÜNCELLEMESİ (TOKENSIZ) ==========
 @app.route("/admin/orders/<int:order_id>/status", methods=["PATCH", "PUT"])
 def update_order_status(order_id):
     """Bu endpoint artık **tokensız** — siparişin durumunu günceller (new -> yolda -> teslim_edildi/teslim_edilemedi)"""
     data = request.json or {}
-    
+
     if "status" not in data:
         return jsonify({"msg": "status gerekli"}), 400
-    
+
     new_status = data["status"]
     valid_statuses = ["new", "yolda", "teslim_edildi", "teslim_edilemedi"]
-    
+
     if new_status not in valid_statuses:
         return jsonify({
             "msg": f"Geçersiz status. Geçerli değerler: {', '.join(valid_statuses)}"
         }), 400
-    
+
     order = Order.query.get_or_404(order_id)
     old_status = order.status
     order.status = new_status
     order.updated_at = datetime.utcnow()
     db.session.commit()
-    
+
     # Kullanıcıya bildirim gönder
     user = order.user
     user_tokens = [dt.token for dt in user.device_tokens]
-    
+
     if user_tokens:
         status_messages = {
             "yolda": "Siparişiniz yola çıktı",
             "teslim_edildi": "Siparişiniz teslim edildi",
             "teslim_edilemedi": "Siparişiniz teslim edilemedi"
         }
-        
+
         if new_status in status_messages:
             title = status_messages[new_status]
             body = f"#{order.id} numaralı siparişiniz {new_status} durumuna geçti."
-            
+
             order_data = {
                 "order_id": str(order.id),
                 "status": new_status,
                 "type": "order_status_update"
             }
-            
+
             admin_keys = [a.fcm_server_key for a in User.query.filter_by(role="admin").all() if a.fcm_server_key]
-            
+
             notify_result = send_fcm_notification(
                 user_tokens,
                 title,
@@ -1233,13 +1206,14 @@ def update_order_status(order_id):
                 fallback_server_keys=admin_keys
             )
             app.logger.info(f"Sipariş #{order_id} durum bildirimi gönderildi: {notify_result}")
-    
+
     app.logger.info(f"Sipariş #{order_id} durumu güncellendi: {old_status} -> {new_status}")
-    
+
     return jsonify({
         "msg": "Sipariş durumu güncellendi",
         "order": format_order_response(order)
     })
+
 
 # ========== HARICI API İÇİN SİPARİŞ DURUM GÜNCELLEMESİ ==========
 @app.route("/api/orders/<int:order_id>/status", methods=["PATCH", "PUT"])
@@ -1251,55 +1225,55 @@ def external_update_order_status(order_id):
     # API key kontrolü
     api_key = request.headers.get("X-API-Key") or request.args.get("api_key")
     expected_key = os.environ.get("EXTERNAL_API_KEY", "your-secret-api-key-here")
-    
+
     if not api_key or api_key != expected_key:
         return jsonify({"msg": "Geçersiz veya eksik API key"}), 401
-    
+
     data = request.json or {}
-    
+
     if "status" not in data:
         return jsonify({"msg": "status gerekli"}), 400
-    
+
     new_status = data["status"]
     valid_statuses = ["new", "yolda", "teslim_edildi", "teslim_edilemedi"]
-    
+
     if new_status not in valid_statuses:
         return jsonify({
             "msg": f"Geçersiz status. Geçerli değerler: {', '.join(valid_statuses)}"
         }), 400
-    
+
     order = Order.query.get_or_404(order_id)
     old_status = order.status
     order.status = new_status
     order.updated_at = datetime.utcnow()
     db.session.commit()
-    
+
     # Kullanıcıya bildirim gönder
     user = order.user
     user_tokens = [dt.token for dt in user.device_tokens]
-    
+
     # Admin'e de bildirim gönderelim
     admins = User.query.filter_by(role="admin").all()
     admin_tokens = [dt.token for a in admins for dt in a.device_tokens]
     admin_keys = [a.fcm_server_key for a in admins if a.fcm_server_key]
-    
+
     if user_tokens:
         status_messages = {
             "yolda": "Siparişiniz yola çıktı",
             "teslim_edildi": "Siparişiniz teslim edildi",
             "teslim_edilemedi": "Siparişiniz teslim edilemedi"
         }
-        
+
         if new_status in status_messages:
             title = status_messages[new_status]
             body = f"#{order.id} numaralı siparişiniz {new_status} durumuna geçti."
-            
+
             order_data = {
                 "order_id": str(order.id),
                 "status": new_status,
                 "type": "order_status_update"
             }
-            
+
             notify_result = send_fcm_notification(
                 user_tokens,
                 title,
@@ -1308,12 +1282,12 @@ def external_update_order_status(order_id):
                 fallback_server_keys=admin_keys
             )
             app.logger.info(f"[EXTERNAL API] Sipariş #{order_id} durum bildirimi gönderildi: {notify_result}")
-    
+
     # Admin'lere bilgi bildirimi
     if admin_tokens and new_status in ["teslim_edildi", "teslim_edilemedi"]:
         admin_title = f"Sipariş #{order.id} - {new_status.replace('_', ' ').title()}"
         admin_body = f"{user.name} {user.surname}'in siparişi {new_status} olarak işaretlendi."
-        
+
         send_fcm_notification(
             admin_tokens,
             admin_title,
@@ -1321,14 +1295,15 @@ def external_update_order_status(order_id):
             data={"order_id": str(order.id), "status": new_status, "type": "order_status_update"},
             fallback_server_keys=admin_keys
         )
-    
+
     app.logger.info(f"[EXTERNAL API] Sipariş #{order_id} durumu güncellendi: {old_status} -> {new_status}")
-    
+
     return jsonify({
         "success": True,
         "msg": "Sipariş durumu güncellendi",
         "order": format_order_response(order)
     })
+
 
 # Admin orders (Mevcut + Geliştirilmiş)
 @app.route("/admin/orders", methods=["GET"])
@@ -1338,21 +1313,21 @@ def admin_orders():
     status = request.args.get("status")  # Filtreleme için
     page = request.args.get("page", default=1, type=int)
     per_page = request.args.get("per_page", default=50, type=int)
-    
+
     if per_page > 100:
         per_page = 100
-    
+
     query = Order.query
-    
+
     if status:
         query = query.filter_by(status=status)
-    
+
     query = query.order_by(Order.created_at.desc())
-    
+
     total = query.count()
     total_pages = (total + per_page - 1) // per_page if per_page else 1
     orders = query.offset((page - 1) * per_page).limit(per_page).all()
-    
+
     return jsonify({
         "total": total,
         "page": page,
@@ -1361,12 +1336,14 @@ def admin_orders():
         "orders": [format_order_response(o) for o in orders]
     })
 
+
 @app.route("/admin/orders/<int:order_id>", methods=["GET"])
 @admin_required
 def admin_order_detail(order_id):
     """Admin belirli bir siparişin detayını görüntüler"""
     order = Order.query.get_or_404(order_id)
     return jsonify(format_order_response(order))
+
 
 # ========== YENİ: DUYURULAR İÇİN GELİŞTİRİLMİŞ ENDPOINT'LER ==========
 @app.route("/announcements", methods=["GET"])
@@ -1375,11 +1352,11 @@ def get_announcements():
     """Hem admin hem de kullanıcılar için duyuruları listeler"""
     page = request.args.get("page", default=1, type=int)
     per_page = request.args.get("per_page", default=20, type=int)
-    
+
     announcements = Announcement.query.order_by(Announcement.created_at.desc()).paginate(
         page=page, per_page=per_page, error_out=False
     )
-    
+
     out = []
     for ann in announcements.items:
         out.append({
@@ -1389,7 +1366,7 @@ def get_announcements():
             "admin_name": f"{ann.admin.name} {ann.admin.surname}",
             "created_at": ann.created_at.isoformat()
         })
-    
+
     return jsonify({
         "announcements": out,
         "total": announcements.total,
@@ -1398,12 +1375,13 @@ def get_announcements():
         "total_pages": announcements.pages
     })
 
+
 @app.route("/announcements/<int:announcement_id>", methods=["GET"])
 @jwt_required()
 def get_announcement(announcement_id):
     """Belirli bir duyurunun detayını getirir"""
     announcement = Announcement.query.get_or_404(announcement_id)
-    
+
     return jsonify({
         "id": announcement.id,
         "title": announcement.title,
@@ -1413,26 +1391,28 @@ def get_announcement(announcement_id):
         "created_at": announcement.created_at.isoformat()
     })
 
+
 @app.route("/admin/announcements/<int:announcement_id>", methods=["DELETE"])
 @admin_required
 def delete_announcement(announcement_id):
     """Admin duyuru silme"""
     announcement = Announcement.query.get_or_404(announcement_id)
-    
+
     # Mevcut kullanıcının admin olduğunu kontrol et (zaten admin_required decorator var)
     current = get_jwt_identity()
     admin = User.query.filter_by(username=current).first()
-    
+
     # Duyuruyu sil
     db.session.delete(announcement)
     db.session.commit()
-    
+
     app.logger.info(f"Admin #{admin.id} duyuru #{announcement_id} sildi")
-    
+
     return jsonify({
         "msg": "Duyuru silindi",
         "announcement_id": announcement_id
     })
+
 
 @app.route("/admin/announcements", methods=["GET"])
 @admin_required
@@ -1440,11 +1420,11 @@ def admin_get_announcements():
     """Admin için duyuruları listeler (tüm duyurular)"""
     page = request.args.get("page", default=1, type=int)
     per_page = request.args.get("per_page", default=50, type=int)
-    
+
     announcements = Announcement.query.order_by(Announcement.created_at.desc()).paginate(
         page=page, per_page=per_page, error_out=False
     )
-    
+
     out = []
     for ann in announcements.items:
         out.append({
@@ -1456,7 +1436,7 @@ def admin_get_announcements():
             "admin_email": ann.admin.email,
             "created_at": ann.created_at.isoformat()
         })
-    
+
     return jsonify({
         "announcements": out,
         "total": announcements.total,
@@ -1465,6 +1445,7 @@ def admin_get_announcements():
         "total_pages": announcements.pages
     })
 
+
 # Admin announce
 @app.route("/admin/announce", methods=["POST"])
 @admin_required
@@ -1472,10 +1453,10 @@ def admin_announce():
     data = request.json or {}
     if "title" not in data or "body" not in data:
         return jsonify({"msg": "title ve body gerekli"}), 400
-    
+
     current = get_jwt_identity()
     admin = User.query.filter_by(username=current).first()
-    
+
     # Duyuruyu veritabanına kaydet
     announcement = Announcement(
         title=data["title"],
@@ -1484,7 +1465,7 @@ def admin_announce():
     )
     db.session.add(announcement)
     db.session.commit()
-    
+
     # Hangi token'lara gönderilecek
     if "tokens" in data and isinstance(data["tokens"], list) and data["tokens"]:
         tokens = data["tokens"]
@@ -1494,24 +1475,25 @@ def admin_announce():
         users = User.query.filter_by(role="user").all()
         tokens = [dt.token for u in users for dt in u.device_tokens]
         app.logger.info(f"Tüm kullanıcılara duyuru: {len(users)} kullanıcı, {len(tokens)} token")
-    
+
     admin_keys = [a.fcm_server_key for a in User.query.filter_by(role="admin").all() if a.fcm_server_key]
     server_keys = admin_keys if admin_keys else None
-    
+
     app.logger.info(f"Duyuru gönderiliyor: {data['title']} - {len(tokens)} token")
-    
+
     res = send_fcm_notification(
-        tokens, 
-        data["title"], 
-        data["body"], 
-        data.get("data"), 
+        tokens,
+        data["title"],
+        data["body"],
+        data.get("data"),
         fallback_server_keys=server_keys
     )
-    
+
     # Yanıta duyuru ID'sini de ekle
     res["announcement_id"] = announcement.id
-    
+
     return jsonify(res)
+
 
 @app.route("/admin/fcm_key", methods=["POST"])
 @admin_required
@@ -1525,6 +1507,7 @@ def set_admin_fcm_key():
     db.session.commit()
     return jsonify({"msg": "FCM server key kaydedildi"})
 
+
 @app.route("/admin/summary", methods=["GET"])
 @admin_required
 def admin_summary():
@@ -1532,21 +1515,21 @@ def admin_summary():
     total_orders = Order.query.count()
     total_users = User.query.filter_by(role="user").count()
     total_announcements = Announcement.query.count()
-    
+
     # Durum bazlı sipariş sayıları
     orders_new = Order.query.filter_by(status="new").count()
     orders_yolda = Order.query.filter_by(status="yolda").count()
     orders_teslim_edildi = Order.query.filter_by(status="teslim_edildi").count()
     orders_teslim_edilemedi = Order.query.filter_by(status="teslim_edilemedi").count()
-    
+
     total_income_val = 0.0
     for o in Order.query.filter_by(status="teslim_edildi").all():
         try:
             total_income_val += float(str(o.total_amount).replace(",", "."))
         except Exception:
             pass
-    total_income_str = f"{round(total_income_val,2):.2f}"
-    
+    total_income_str = f"{round(total_income_val, 2):.2f}"
+
     return jsonify({
         "total_products": total_products,
         "total_orders": total_orders,
@@ -1560,6 +1543,7 @@ def admin_summary():
             "teslim_edilemedi": orders_teslim_edilemedi
         }
     })
+
 
 # User profile
 @app.route("/me", methods=["GET"])
@@ -1579,6 +1563,7 @@ def get_me():
         "created_at": user.created_at.isoformat(),
         "device_tokens": [dt.token for dt in user.device_tokens]
     })
+
 
 @app.route("/me", methods=["PUT"])
 @jwt_required()
@@ -1625,6 +1610,7 @@ def update_me():
         response["new_token"] = new_token
 
     return jsonify(response)
+
 
 @app.route("/me", methods=["PATCH"])
 @jwt_required()
@@ -1676,6 +1662,7 @@ def patch_me():
 
     return jsonify(response)
 
+
 @app.route("/admin/me", methods=["PATCH"])
 @admin_required
 def patch_admin_me():
@@ -1725,6 +1712,7 @@ def patch_admin_me():
 
     return jsonify(response)
 
+
 # ---------- Helpers used earlier: notify discount ----------
 def notify_users_about_discount(product: Product):
     title = f"{product.title} için {product.discount_percent}% indirim!"
@@ -1733,17 +1721,18 @@ def notify_users_about_discount(product: Product):
     users = User.query.filter_by(role="user").all()
     tokens = [dt.token for u in users for dt in u.device_tokens]
     admin_keys = [a.fcm_server_key for a in User.query.filter_by(role="admin").all() if a.fcm_server_key]
-    
+
     app.logger.info(f"İndirim bildirimi: {len(tokens)} kullanıcı token'ı bulundu")
-    
+
     res = send_fcm_notification(
-        tokens, 
-        title, 
-        body, 
-        data={"product_id": str(product.id), "type": "discount"}, 
+        tokens,
+        title,
+        body,
+        data={"product_id": str(product.id), "type": "discount"},
         fallback_server_keys=admin_keys
     )
     return res
+
 
 # ---------- Run ----------
 if __name__ == "__main__":
