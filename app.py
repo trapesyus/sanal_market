@@ -38,6 +38,9 @@ app = Flask(__name__)
 # We will use a file-based DuckDB database at BASE_DIR/app.duckdb.
 DB_FILE = os.path.join(BASE_DIR, "app.duckdb")
 
+# Minimum order amount configuration
+MINIMUM_ORDER_AMOUNT = 300.0  # Default minimum order amount
+
 
 def _make_duckdb_uri(path):
     # If absolute path -> use duckdb://// + stripped leading slash
@@ -105,6 +108,7 @@ def setup_database():
                     conn.execute(text("DROP TABLE IF EXISTS category"))
                     conn.execute(text("DROP TABLE IF EXISTS device_token"))
                     conn.execute(text("DROP TABLE IF EXISTS announcement"))
+                    conn.execute(text("DROP TABLE IF EXISTS app_config"))
                     conn.execute(text("DROP TABLE IF EXISTS \"user\""))
                 except Exception as e:
                     app.logger.warning(f"drop table sırasında uyarı: {e}")
@@ -112,7 +116,7 @@ def setup_database():
                 # Drop sequences if exist (sessizce devam et)
                 seqs = [
                     "seq_user", "seq_device_token", "seq_category", "seq_product",
-                    "seq_cart_item", "seq_order", "seq_order_item", "seq_announcement"
+                    "seq_cart_item", "seq_order", "seq_order_item", "seq_announcement", "seq_app_config"
                 ]
                 for s in seqs:
                     try:
@@ -130,6 +134,7 @@ def setup_database():
                     conn.execute(text("CREATE SEQUENCE IF NOT EXISTS seq_order START 1"))
                     conn.execute(text("CREATE SEQUENCE IF NOT EXISTS seq_order_item START 1"))
                     conn.execute(text("CREATE SEQUENCE IF NOT EXISTS seq_announcement START 1"))
+                    conn.execute(text("CREATE SEQUENCE IF NOT EXISTS seq_app_config START 1"))
                 except Exception as e:
                     app.logger.warning(f"sequence oluşturma sırasında uyarı: {e}")
 
@@ -202,6 +207,7 @@ def setup_database():
                     status VARCHAR(50) DEFAULT 'new',
                     payment_method VARCHAR(50) DEFAULT 'kapida_nakit',
                     delivery_address TEXT,
+                    note TEXT,
                     created_at TIMESTAMP,
                     updated_at TIMESTAMP,
                     FOREIGN KEY(user_id) REFERENCES "user"(id)
@@ -231,6 +237,26 @@ def setup_database():
                 )
                 """))
 
+                # App config table for minimum order amount
+                conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS app_config (
+                    id INTEGER PRIMARY KEY DEFAULT nextval('seq_app_config'),
+                    config_key VARCHAR(100) UNIQUE NOT NULL,
+                    config_value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """))
+
+                # Insert default minimum order amount
+                try:
+                    conn.execute(text("""
+                    INSERT INTO app_config (config_key, config_value) 
+                    VALUES ('minimum_order_amount', '300.0')
+                    ON CONFLICT (config_key) DO NOTHING
+                    """))
+                except Exception as e:
+                    app.logger.warning(f"Default config eklenirken hata: {e}")
+
                 conn.commit()
                 app.logger.info("DuckDB tabloları oluşturuldu/varsa korundu.")
             else:
@@ -240,6 +266,17 @@ def setup_database():
                 except Exception as e:
                     app.logger.warning(f"drop_all sırasında uyarı (non-duckdb): {e}")
                 db.create_all()
+                
+                # Insert default minimum order amount for non-duckdb
+                try:
+                    config = AppConfig.query.filter_by(config_key='minimum_order_amount').first()
+                    if not config:
+                        default_config = AppConfig(config_key='minimum_order_amount', config_value='300.0')
+                        db.session.add(default_config)
+                        db.session.commit()
+                except Exception as e:
+                    app.logger.warning(f"Default config eklenirken hata (non-duckdb): {e}")
+                
                 app.logger.info("SQLAlchemy create_all() çalıştırıldı (non-duckdb).")
 
             conn.close()
@@ -340,6 +377,7 @@ class Order(db.Model):
     status = db.Column(db.String(50), default="new")  # new, yolda, teslim_edildi, teslim_edilemedi
     payment_method = db.Column(db.String(50), default="kapida_nakit")
     delivery_address = db.Column(db.Text, nullable=True)  # Teslimat adresi
+    note = db.Column(db.Text, nullable=True)  # Sipariş notu
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     items = db.relationship("OrderItem", backref="order", lazy=True)
@@ -362,6 +400,13 @@ class Announcement(db.Model):
     admin_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     admin = db.relationship("User")
+
+
+class AppConfig(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    config_key = db.Column(db.String(100), unique=True, nullable=False)
+    config_value = db.Column(db.Text, nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 # ---------- Helpers ----------
@@ -451,6 +496,36 @@ def _parse_stock_value(s):
         return int(val)
     except Exception:
         raise ValueError("stock integer formatında olmalı (örn. '10')")
+
+
+def get_minimum_order_amount():
+    """Get minimum order amount from database"""
+    try:
+        config = AppConfig.query.filter_by(config_key='minimum_order_amount').first()
+        if config and config.config_value:
+            return float(config.config_value)
+        else:
+            # Default value if not set
+            return MINIMUM_ORDER_AMOUNT
+    except Exception as e:
+        app.logger.error(f"Minimum order amount alınırken hata: {e}")
+        return MINIMUM_ORDER_AMOUNT
+
+
+def set_minimum_order_amount(amount):
+    """Set minimum order amount in database"""
+    try:
+        config = AppConfig.query.filter_by(config_key='minimum_order_amount').first()
+        if config:
+            config.config_value = str(amount)
+        else:
+            config = AppConfig(config_key='minimum_order_amount', config_value=str(amount))
+            db.session.add(config)
+        db.session.commit()
+        return True
+    except Exception as e:
+        app.logger.error(f"Minimum order amount ayarlanırken hata: {e}")
+        return False
 
 
 # ---------- Firebase / FCM Setup ----------
@@ -665,6 +740,7 @@ def format_order_response(order):
         "status": order.status,
         "payment_method": order.payment_method,
         "delivery_address": order.delivery_address or order.user.address,
+        "note": order.note,  # Sipariş notu eklendi
         "created_at": order.created_at.isoformat(),
         "updated_at": order.updated_at.isoformat() if order.updated_at else order.created_at.isoformat(),
         "items": [{
@@ -1245,6 +1321,7 @@ def checkout():
     data = request.json or {}
     payment_method = data.get("payment_method", "kapida_nakit")
     delivery_address = data.get("delivery_address")  # Özel teslimat adresi
+    note = data.get("note", "")  # Sipariş notu
 
     if payment_method in ("card_on_delivery", "kapida_kart"):
         payment_method = "kapida_kart"
@@ -1273,6 +1350,13 @@ def checkout():
 
     total_rounded = round(total, 2)
 
+    # Minimum sipariş tutarı kontrolü
+    minimum_order_amount = get_minimum_order_amount()
+    if total_rounded < minimum_order_amount:
+        return jsonify({
+            "msg": f"Minimum sipariş tutarı {minimum_order_amount} TL'dir. Sipariş tutarınız: {total_rounded} TL"
+        }), 400
+
     # Teslimat adresini belirle (gönderilmişse özel adresi kullan, yoksa kullanıcı adresini)
     final_address = delivery_address if delivery_address else user.address
 
@@ -1281,7 +1365,8 @@ def checkout():
         user_id=user.id,
         total_amount=f"{total_rounded:.2f}",
         payment_method=payment_method,
-        delivery_address=final_address
+        delivery_address=final_address,
+        note=note  # Sipariş notu eklendi
     )
     db.session.add(order)
     db.session.commit()
@@ -1331,8 +1416,50 @@ def checkout():
         "order_id": order.id,
         "payment_method": order.payment_method,
         "total_amount": order.total_amount,
-        "delivery_address": final_address
+        "delivery_address": final_address,
+        "note": note
     })
+
+
+# ========== MINIMUM ORDER AMOUNT ENDPOINTS ==========
+@app.route("/admin/minimum_order_amount", methods=["GET"])
+@admin_required
+def get_minimum_order_amount_api():
+    """Admin için minimum sipariş tutarını getirir"""
+    amount = get_minimum_order_amount()
+    return jsonify({"minimum_order_amount": amount})
+
+
+@app.route("/admin/minimum_order_amount", methods=["POST"])
+@admin_required
+def set_minimum_order_amount_api():
+    """Admin için minimum sipariş tutarını ayarlar"""
+    data = request.json or {}
+    if "amount" not in data:
+        return jsonify({"msg": "amount gerekli"}), 400
+    
+    try:
+        amount = float(data["amount"])
+        if amount < 0:
+            return jsonify({"msg": "Minimum sipariş tutarı negatif olamaz"}), 400
+    except (ValueError, TypeError):
+        return jsonify({"msg": "Geçerli bir sayısal değer giriniz"}), 400
+
+    success = set_minimum_order_amount(amount)
+    if success:
+        return jsonify({
+            "msg": "Minimum sipariş tutarı güncellendi", 
+            "minimum_order_amount": amount
+        })
+    else:
+        return jsonify({"msg": "Minimum sipariş tutarı güncellenemedi"}), 500
+
+
+@app.route("/minimum_order_amount", methods=["GET"])
+def get_minimum_order_amount_public():
+    """Herkes için minimum sipariş tutarını getirir (genel bilgi)"""
+    amount = get_minimum_order_amount()
+    return jsonify({"minimum_order_amount": amount})
 
 
 # ========== YENİ: KULLANICI SİPARİŞLERİ ==========
@@ -1767,12 +1894,16 @@ def admin_summary():
             pass
     total_income_str = f"{round(total_income_val, 2):.2f}"
 
+    # Minimum sipariş tutarı
+    minimum_order_amount = get_minimum_order_amount()
+
     return jsonify({
         "total_products": total_products,
         "total_orders": total_orders,
         "total_users": total_users,
         "total_announcements": total_announcements,
         "total_income": total_income_str,
+        "minimum_order_amount": minimum_order_amount,
         "order_status": {
             "new": orders_new,
             "yolda": orders_yolda,
