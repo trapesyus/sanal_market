@@ -9,7 +9,7 @@ import importlib.util
 from functools import wraps
 from datetime import datetime, timedelta
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, url_for
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -29,7 +29,8 @@ except Exception:
 # ---------- Config ----------
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+IMAGE_FOLDER = os.path.join(UPLOAD_FOLDER, "images")
+os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
 
@@ -50,6 +51,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = _make_duckdb_uri(DB_FILE)
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "change-this-secret")
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["IMAGE_FOLDER"] = IMAGE_FOLDER
 
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
@@ -172,8 +174,7 @@ def setup_database():
                     description TEXT,
                     price VARCHAR(64) NOT NULL,
                     stock INTEGER DEFAULT 0,
-                    image_base64 TEXT,
-                    image_mime VARCHAR(80),
+                    image_filename VARCHAR(255),
                     category_id INTEGER,
                     discount_percent VARCHAR(64) DEFAULT '0',
                     created_at TIMESTAMP,
@@ -287,8 +288,7 @@ class Product(db.Model):
     description = db.Column(db.Text)
     price = db.Column(db.String(64), nullable=False)  # string per requirement
     stock = db.Column(db.Integer, default=0)  # stored as int internally
-    image_base64 = db.Column(db.Text, nullable=True)  # Resim base64 formatında
-    image_mime = db.Column(db.String(80), nullable=True)  # Resim MIME type
+    image_filename = db.Column(db.String(255), nullable=True)  # Resim dosya adı
     category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
     discount_percent = db.Column(db.String(64), default="0")  # string percent
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -316,6 +316,12 @@ class Product(db.Model):
         else:
             val = round(p, 2)
         return f"{val:.2f}"
+
+    @property
+    def image_url(self):
+        if self.image_filename:
+            return url_for('get_image', filename=self.image_filename, _external=True)
+        return None
 
 
 class CartItem(db.Model):
@@ -372,24 +378,59 @@ def admin_required(fn):
     return wrapper
 
 
-def _file_storage_to_base64(file_storage):
-    data = file_storage.read()
+def save_base64_image(base64_data, filename=None):
+    """Base64 verisini dosyaya kaydeder ve dosya adını döndürür"""
     try:
-        file_storage.stream.seek(0)
-    except Exception:
-        pass
-    b64 = base64.b64encode(data).decode("utf-8")
-    filename = getattr(file_storage, "filename", "") or ""
-    mime = None
-    if "." in filename:
-        ext = filename.rsplit(".", 1)[1].lower()
-        if ext in ("jpg", "jpeg"):
-            mime = "image/jpeg"
-        elif ext == "png":
-            mime = "image/png"
-        elif ext == "gif":
-            mime = "image/gif"
-    return b64, mime
+        # Base64 başlığını kaldır (eğer varsa)
+        if ',' in base64_data:
+            base64_data = base64_data.split(',', 1)[1]
+        
+        # Base64 verisini decode et
+        image_data = base64.b64decode(base64_data)
+        
+        # Dosya adını oluştur
+        if not filename:
+            file_ext = '.jpg'  # Varsayılan uzantı
+            # MIME type'a göre uzantı belirle (opsiyonel)
+            if base64_data.startswith('/9j') or base64_data.startswith('iV'):
+                file_ext = '.jpg'
+            elif base64_data.startswith('iVBOR'):
+                file_ext = '.png'
+            elif base64_data.startswith('R0lGOD'):
+                file_ext = '.gif'
+            filename = f"{uuid.uuid4().hex}{file_ext}"
+        
+        filepath = os.path.join(app.config['IMAGE_FOLDER'], filename)
+        
+        # Dosyayı kaydet
+        with open(filepath, 'wb') as f:
+            f.write(image_data)
+        
+        return filename
+    except Exception as e:
+        app.logger.error(f"Resim kaydetme hatası: {e}")
+        return None
+
+
+def save_uploaded_file(file_storage, filename=None):
+    """Yüklenen dosyayı kaydeder ve dosya adını döndürür"""
+    try:
+        if not filename:
+            # Orijinal dosya adından uzantıyı al
+            original_name = file_storage.filename
+            if original_name and '.' in original_name:
+                file_ext = '.' + original_name.rsplit('.', 1)[1].lower()
+            else:
+                file_ext = '.jpg'  # Varsayılan uzantı
+            
+            filename = f"{uuid.uuid4().hex}{file_ext}"
+        
+        filepath = os.path.join(app.config['IMAGE_FOLDER'], filename)
+        file_storage.save(filepath)
+        return filename
+    except Exception as e:
+        app.logger.error(f"Dosya kaydetme hatası: {e}")
+        return None
 
 
 def _is_numeric_string(s):
@@ -630,6 +671,7 @@ def format_order_response(order):
             "id": it.id,
             "product_id": it.product_id,
             "product_title": it.product.title,
+            "product_image_url": it.product.image_url,
             "quantity": it.quantity,
             "unit_price": str(it.unit_price),
             "subtotal": f"{float(str(it.unit_price).replace(',', '.')) * it.quantity:.2f}"
@@ -641,6 +683,13 @@ def format_order_response(order):
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+# Resim sunan endpoint
+@app.route("/images/<filename>")
+def get_image(filename):
+    """Resim dosyalarını sunar"""
+    return send_from_directory(app.config["IMAGE_FOLDER"], filename)
 
 
 # --- Auth ---
@@ -809,7 +858,6 @@ def create_product():
         description = data.get("description", "")
         category_id = data.get("category_id")
         image_base64 = data.get("image_base64")
-        image_mime = data.get("image_mime")
         discount_percent_str = data.get("discount_percent", "0")
     else:
         title = request.form.get("title")
@@ -818,11 +866,10 @@ def create_product():
         description = request.form.get("description", "")
         category_id = request.form.get("category_id")
         image_base64 = None
-        image_mime = None
         discount_percent_str = request.form.get("discount_percent", "0")
         if "image" in request.files:
             file = request.files["image"]
-            image_base64, image_mime = _file_storage_to_base64(file)
+            image_base64 = file  # Burada artık base64 değil, dosya var
 
     if not title or price_str is None:
         return jsonify({"msg": "title ve price gerekli"}), 400
@@ -851,9 +898,20 @@ def create_product():
             p.category_id = int(category_id)
         except Exception:
             pass
+
+    # Resim işleme
     if image_base64:
-        p.image_base64 = image_base64
-        p.image_mime = image_mime
+        if request.is_json:
+            # Base64 string olarak geldi
+            filename = save_base64_image(image_base64)
+            if filename:
+                p.image_filename = filename
+        else:
+            # Dosya olarak geldi
+            filename = save_uploaded_file(image_base64)
+            if filename:
+                p.image_filename = filename
+
     db.session.add(p)
     db.session.commit()
 
@@ -901,8 +959,17 @@ def update_product(product_id):
                     return jsonify({"msg": "discount_percent numeric stringında olmalı"}), 400
                 p.discount_percent = str(dp)
         if "image_base64" in data:
-            p.image_base64 = data.get("image_base64")
-            p.image_mime = data.get("image_mime")
+            filename = save_base64_image(data.get("image_base64"))
+            if filename:
+                # Eski resmi sil
+                if p.image_filename:
+                    try:
+                        old_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
+                        if os.path.exists(old_path):
+                            os.remove(old_path)
+                    except Exception as e:
+                        app.logger.warning(f"Eski resim silinemedi: {e}")
+                p.image_filename = filename
     else:
         data = request.form or {}
         if "title" in data: p.title = data["title"]
@@ -929,9 +996,17 @@ def update_product(product_id):
             p.discount_percent = str(dp)
         if "image" in request.files:
             file = request.files["image"]
-            b64, mime = _file_storage_to_base64(file)
-            p.image_base64 = b64
-            p.image_mime = mime
+            filename = save_uploaded_file(file)
+            if filename:
+                # Eski resmi sil
+                if p.image_filename:
+                    try:
+                        old_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
+                        if os.path.exists(old_path):
+                            os.remove(old_path)
+                    except Exception as e:
+                        app.logger.warning(f"Eski resim silinemedi: {e}")
+                p.image_filename = filename
 
     db.session.commit()
 
@@ -951,6 +1026,15 @@ def update_product(product_id):
 @admin_required
 def delete_product(product_id):
     p = Product.query.get_or_404(product_id)
+    # Resmi de sil
+    if p.image_filename:
+        try:
+            image_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
+            if os.path.exists(image_path):
+                os.remove(image_path)
+        except Exception as e:
+            app.logger.warning(f"Resim dosyası silinemedi: {e}")
+    
     db.session.delete(p)
     db.session.commit()
     return jsonify({"msg": "Ürün silindi"})
@@ -1029,8 +1113,7 @@ def list_products():
             "price": str(p.price),
             "price_after_discount": p.price_after_discount,
             "stock": str(p.stock),
-            "image_base64": p.image_base64,
-            "image_mime": p.image_mime,
+            "image_url": p.image_url,
             "category": p.category.name if p.category else None,
             "discount_percent": str(p.discount_percent)
         })
@@ -1061,8 +1144,7 @@ def get_cart():
                 "price": str(it.product.price),
                 "price_after_discount": it.product.price_after_discount,
                 "stock": str(it.product.stock),
-                "image_base64": it.product.image_base64,
-                "image_mime": it.product.image_mime
+                "image_url": it.product.image_url,
             },
             "quantity": it.quantity
         })
@@ -1149,8 +1231,7 @@ def update_cart_item(cart_item_id):
             "price": str(product.price),
             "price_after_discount": product.price_after_discount,
             "stock": str(product.stock),
-            "image_base64": product.image_base64,
-            "image_mime": product.image_mime
+            "image_url": product.image_url,
         },
         "quantity": item.quantity
     }
@@ -1904,4 +1985,4 @@ if __name__ == "__main__":
     # Veritabanını kur
     setup_database()
     # reloader'ı kapattık — development sırasında çift process oluşmasını engeller
-    app.run(host="0.0.0.0", port=8000, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
