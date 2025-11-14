@@ -35,9 +35,8 @@ app = Flask(__name__)
 
 # ---------- Choose DuckDB as backend ----------
 # We will use a file-based DuckDB database at BASE_DIR/app.duckdb.
-# Note: For absolute paths with the duckdb SQLAlchemy URI some tools require
-# 4 slashes (duckdb:////absolute/path). We'll construct the URI carefully.
 DB_FILE = os.path.join(BASE_DIR, "app.duckdb")
+
 
 def _make_duckdb_uri(path):
     # If absolute path -> use duckdb://// + stripped leading slash
@@ -45,6 +44,7 @@ def _make_duckdb_uri(path):
         return "duckdb:////" + path.lstrip("/")
     # relative -> duckdb:///relative/path
     return "duckdb:///" + path
+
 
 app.config["SQLALCHEMY_DATABASE_URI"] = _make_duckdb_uri(DB_FILE)
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -59,7 +59,6 @@ jwt = JWTManager(app)
 if not DUCKDB_AVAILABLE:
     if not os.path.exists("logs"):
         os.makedirs("logs", exist_ok=True)
-    # minimal logging to stderr/file
     lh = logging.getLogger()
     lh.setLevel(logging.INFO)
     fh = logging.FileHandler("logs/app.log")
@@ -77,22 +76,176 @@ app.logger.setLevel(logging.INFO)
 app.logger.addHandler(file_handler)
 app.logger.addHandler(logging.StreamHandler())
 
-# ---------- Database Setup ----------
+
+# ---------- Database Setup (DUCKDB Uyumlu) ----------
 def setup_database():
-    """Veritabanı tablolarını oluşturur. (DuckDB backend için drop_all + create_all)"""
+    """
+    DuckDB uyumlu tablo kurucusu.
+    - DuckDB kullanılıyorsa SQLAlchemy'nin ürettiği SERIAL tip hatasını atlamak için
+      elle CREATE SEQUENCE + CREATE TABLE IF NOT EXISTS (id INTEGER DEFAULT nextval(...)) kullanır.
+    - Veriler kaybolsa sakınca yoksa, DB dosyasını silip sıfırdan başlatabilirsiniz.
+    """
     try:
         with app.app_context():
-            # Drop all mevcut tabloları kaldır (veriler kaybolur — belirttiğiniz üzere sorun yok).
-            app.logger.info("Veritabanı başlangıç: mevcut tablolar kaldırılıyor ve yeniden oluşturuluyor.")
-            try:
-                db.drop_all()
-            except Exception as e:
-                app.logger.warning(f"db.drop_all sırasında hata: {e} — devam ediliyor.")
-            # Create all tables according to SQLAlchemy modelleri
-            db.create_all()
-            app.logger.info(f"Veritabanı başarıyla kuruldu ve tablolar oluşturuldu. DB URI: {app.config.get('SQLALCHEMY_DATABASE_URI')}")
+            engine_uri = app.config.get("SQLALCHEMY_DATABASE_URI", "") or ""
+            is_duckdb = engine_uri.startswith("duckdb:")
+            conn = db.engine.connect()
+
+            if is_duckdb:
+                app.logger.info("DuckDB detected — elle tablolar/sequence'ler oluşturuluyor.")
+
+                # Önce varsa tablo/sequence drop etmeye çalış (hata olursa devam)
+                try:
+                    conn.execute(text("DROP TABLE IF EXISTS order_item"))
+                    conn.execute(text("DROP TABLE IF EXISTS \"order\""))
+                    conn.execute(text("DROP TABLE IF EXISTS cart_item"))
+                    conn.execute(text("DROP TABLE IF EXISTS product"))
+                    conn.execute(text("DROP TABLE IF EXISTS category"))
+                    conn.execute(text("DROP TABLE IF EXISTS device_token"))
+                    conn.execute(text("DROP TABLE IF EXISTS announcement"))
+                    conn.execute(text("DROP TABLE IF EXISTS \"user\""))
+                except Exception as e:
+                    app.logger.warning(f"drop table sırasında uyarı: {e}")
+
+                # Drop sequences if exist (sessizce devam et)
+                seqs = [
+                    "seq_user", "seq_device_token", "seq_category", "seq_product",
+                    "seq_cart_item", "seq_order", "seq_order_item", "seq_announcement"
+                ]
+                for s in seqs:
+                    try:
+                        conn.execute(text(f"DROP SEQUENCE IF EXISTS {s}"))
+                    except Exception:
+                        pass
+
+                # Create sequences
+                try:
+                    conn.execute(text("CREATE SEQUENCE IF NOT EXISTS seq_user START 1"))
+                    conn.execute(text("CREATE SEQUENCE IF NOT EXISTS seq_device_token START 1"))
+                    conn.execute(text("CREATE SEQUENCE IF NOT EXISTS seq_category START 1"))
+                    conn.execute(text("CREATE SEQUENCE IF NOT EXISTS seq_product START 1"))
+                    conn.execute(text("CREATE SEQUENCE IF NOT EXISTS seq_cart_item START 1"))
+                    conn.execute(text("CREATE SEQUENCE IF NOT EXISTS seq_order START 1"))
+                    conn.execute(text("CREATE SEQUENCE IF NOT EXISTS seq_order_item START 1"))
+                    conn.execute(text("CREATE SEQUENCE IF NOT EXISTS seq_announcement START 1"))
+                except Exception as e:
+                    app.logger.warning(f"sequence oluşturma sırasında uyarı: {e}")
+
+                # CREATE TABLEs (DuckDB uyumlu)
+                conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS "user" (
+                    id INTEGER PRIMARY KEY DEFAULT nextval('seq_user'),
+                    username VARCHAR(80) NOT NULL UNIQUE,
+                    password_hash VARCHAR(256) NOT NULL,
+                    email VARCHAR(120) NOT NULL,
+                    name VARCHAR(80),
+                    surname VARCHAR(80),
+                    phone VARCHAR(50),
+                    address TEXT,
+                    role VARCHAR(20),
+                    fcm_server_key TEXT,
+                    created_at TIMESTAMP
+                )
+                """))
+
+                conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS device_token (
+                    id INTEGER PRIMARY KEY DEFAULT nextval('seq_device_token'),
+                    token VARCHAR(512) NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    created_at TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES "user"(id)
+                )
+                """))
+
+                conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS category (
+                    id INTEGER PRIMARY KEY DEFAULT nextval('seq_category'),
+                    name VARCHAR(80) UNIQUE NOT NULL
+                )
+                """))
+
+                conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS product (
+                    id INTEGER PRIMARY KEY DEFAULT nextval('seq_product'),
+                    title VARCHAR(200) NOT NULL,
+                    description TEXT,
+                    price VARCHAR(64) NOT NULL,
+                    stock INTEGER DEFAULT 0,
+                    image_base64 TEXT,
+                    image_mime VARCHAR(80),
+                    category_id INTEGER,
+                    discount_percent VARCHAR(64) DEFAULT '0',
+                    created_at TIMESTAMP,
+                    FOREIGN KEY(category_id) REFERENCES category(id)
+                )
+                """))
+
+                conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS cart_item (
+                    id INTEGER PRIMARY KEY DEFAULT nextval('seq_cart_item'),
+                    user_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    quantity INTEGER DEFAULT 1,
+                    created_at TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES "user"(id),
+                    FOREIGN KEY(product_id) REFERENCES product(id)
+                )
+                """))
+
+                conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS "order" (
+                    id INTEGER PRIMARY KEY DEFAULT nextval('seq_order'),
+                    user_id INTEGER NOT NULL,
+                    total_amount VARCHAR(64) NOT NULL,
+                    status VARCHAR(50) DEFAULT 'new',
+                    payment_method VARCHAR(50) DEFAULT 'kapida_nakit',
+                    delivery_address TEXT,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES "user"(id)
+                )
+                """))
+
+                conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS order_item (
+                    id INTEGER PRIMARY KEY DEFAULT nextval('seq_order_item'),
+                    order_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    unit_price VARCHAR(64) NOT NULL,
+                    FOREIGN KEY(order_id) REFERENCES "order"(id),
+                    FOREIGN KEY(product_id) REFERENCES product(id)
+                )
+                """))
+
+                conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS announcement (
+                    id INTEGER PRIMARY KEY DEFAULT nextval('seq_announcement'),
+                    title VARCHAR(200) NOT NULL,
+                    body TEXT NOT NULL,
+                    admin_id INTEGER NOT NULL,
+                    created_at TIMESTAMP,
+                    FOREIGN KEY(admin_id) REFERENCES "user"(id)
+                )
+                """))
+
+                conn.commit()
+                app.logger.info("DuckDB tabloları oluşturuldu/varsa korundu.")
+            else:
+                # fallback: normal SQLAlchemy create_all() (ör. sqlite)
+                try:
+                    db.drop_all()
+                except Exception as e:
+                    app.logger.warning(f"drop_all sırasında uyarı (non-duckdb): {e}")
+                db.create_all()
+                app.logger.info("SQLAlchemy create_all() çalıştırıldı (non-duckdb).")
+
+            conn.close()
+
     except Exception as e:
         app.logger.exception(f"Veritabanı kurulum hatası: {e}")
+
 
 # ---------- Models ----------
 class User(db.Model):
@@ -262,6 +415,9 @@ def _parse_stock_value(s):
 # ---------- Firebase / FCM Setup ----------
 SERVICE_ACCOUNT_PATH = "/root/perem-sa-new.json"  # as requested
 firebase_app = None
+
+if DUCKDB_AVAILABLE is None:
+    DUCKDB_AVAILABLE = False
 
 try:
     import firebase_admin
@@ -1734,8 +1890,18 @@ def notify_users_about_discount(product: Product):
     return res
 
 
-# ---------- Run ----------
+# ---------- Teardown + Run ----------
+@app.teardown_appcontext
+def shutdown_session(exception=None):
+    try:
+        db.session.remove()
+        db.engine.dispose()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     # Veritabanını kur
     setup_database()
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    # reloader'ı kapattık — development sırasında çift process oluşmasını engeller
+    app.run(host="0.0.0.0", port=8000, debug=True, use_reloader=False)
