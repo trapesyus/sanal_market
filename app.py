@@ -1124,20 +1124,44 @@ def update_product(product_id):
 @app.route("/admin/products/<int:product_id>", methods=["DELETE"])
 @admin_required
 def delete_product(product_id):
-    p = Product.query.get_or_404(product_id)
-    # Resmi de sil
-    if p.image_filename:
-        try:
-            image_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
-            if os.path.exists(image_path):
-                os.remove(image_path)
-        except Exception as e:
-            app.logger.warning(f"Resim dosyası silinemedi: {e}")
-    
-    db.session.delete(p)
-    db.session.commit()
-    return jsonify({"msg": "Ürün silindi"})
-
+    try:
+        p = Product.query.get_or_404(product_id)
+        
+        # İlişkili cart_item kayıtlarını sil
+        cart_items = CartItem.query.filter_by(product_id=product_id).all()
+        for cart_item in cart_items:
+            db.session.delete(cart_item)
+        
+        # İlişkili order_item kayıtlarını kontrol et
+        order_items = OrderItem.query.filter_by(product_id=product_id).all()
+        if order_items:
+            return jsonify({
+                "msg": "Bu ürün siparişlerde kullanıldığı için silinemez. Önce ilgili siparişleri silmeniz gerekir.",
+                "order_items_count": len(order_items)
+            }), 400
+        
+        # Resmi sil
+        if p.image_filename:
+            try:
+                image_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
+                if os.path.exists(image_path):
+                    os.remove(image_path)
+                    app.logger.info(f"Resim dosyası silindi: {p.image_filename}")
+            except Exception as e:
+                app.logger.warning(f"Resim dosyası silinemedi: {e}")
+                # Resim silinemese bile ürün silme işlemine devam et
+        
+        # Ürünü sil
+        db.session.delete(p)
+        db.session.commit()
+        
+        app.logger.info(f"Ürün #{product_id} başarıyla silindi")
+        return jsonify({"msg": "Ürün silindi"})
+        
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Ürün silme hatası: {str(e)}")
+        return jsonify({"msg": f"Ürün silinirken hata oluştu: {str(e)}"}), 500
 
 @app.route("/admin/products/<int:product_id>/discount", methods=["POST"])
 @admin_required
