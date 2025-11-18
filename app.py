@@ -357,7 +357,13 @@ class Product(db.Model):
     @property
     def image_url(self):
         if self.image_filename:
-            return url_for('get_image', filename=self.image_filename, _external=True)
+            # Resim dosyasının var olup olmadığını kontrol et
+            filepath = os.path.join(app.config['IMAGE_FOLDER'], self.image_filename)
+            if os.path.exists(filepath):
+                return url_for('get_image', filename=self.image_filename, _external=True)
+            else:
+                app.logger.warning(f"Resim dosyası bulunamadı: {self.image_filename}")
+                return None
         return None
 
 
@@ -476,6 +482,28 @@ def save_uploaded_file(file_storage, filename=None):
     except Exception as e:
         app.logger.error(f"Dosya kaydetme hatası: {e}")
         return None
+
+
+def safe_delete_image(filename):
+    """Resmi güvenli bir şekilde siler - dosya yoksa hata vermez"""
+    try:
+        if not filename:
+            return True
+            
+        filepath = os.path.join(app.config['IMAGE_FOLDER'], filename)
+        
+        # Dosya var mı kontrol et
+        if os.path.exists(filepath):
+            os.remove(filepath)
+            app.logger.info(f"Resim dosyası silindi: {filename}")
+            return True
+        else:
+            app.logger.warning(f"Silinecek resim dosyası bulunamadı: {filename}")
+            return True  # Dosya zaten yoksa başarılı say
+            
+    except Exception as e:
+        app.logger.error(f"Resim silme hatası ({filename}): {e}")
+        return False  # Hata oluştu
 
 
 def _is_numeric_string(s):
@@ -764,8 +792,17 @@ def health():
 # Resim sunan endpoint
 @app.route("/images/<filename>")
 def get_image(filename):
-    """Resim dosyalarını sunar"""
-    return send_from_directory(app.config["IMAGE_FOLDER"], filename)
+    """Resim dosyalarını sunar - dosya yoksa 404 döndürür"""
+    try:
+        file_path = os.path.join(app.config["IMAGE_FOLDER"], filename)
+        if not os.path.exists(file_path):
+            app.logger.warning(f"Resim dosyası bulunamadı: {filename}")
+            return jsonify({"error": "Resim bulunamadı"}), 404
+        
+        return send_from_directory(app.config["IMAGE_FOLDER"], filename)
+    except Exception as e:
+        app.logger.error(f"Resim sunma hatası: {e}")
+        return jsonify({"error": "Resim yüklenirken hata oluştu"}), 500
 
 
 # --- Auth ---
@@ -1005,120 +1042,111 @@ def create_product():
 @app.route("/admin/products/<int:product_id>", methods=["PUT"])
 @admin_required
 def update_product(product_id):
-    p = Product.query.get_or_404(product_id)
-    old_discount = str(p.discount_percent)
+    try:
+        p = Product.query.get_or_404(product_id)
+        old_discount = str(p.discount_percent)
 
-    if request.is_json:
-        data = request.get_json()
-        if "title" in data: 
-            p.title = data.get("title")
-        if "price" in data:
-            price_str = data.get("price")
-            if price_str is not None:
+        if request.is_json:
+            data = request.get_json()
+            if "title" in data: 
+                p.title = data.get("title")
+            if "price" in data:
+                price_str = data.get("price")
+                if price_str is not None:
+                    if not _is_numeric_string(price_str):
+                        return jsonify({"msg": "price numeric string formatında olmalı"}), 400
+                    p.price = str(price_str)
+            if "stock" in data:
+                try:
+                    p.stock = _parse_stock_value(data.get("stock"))
+                except ValueError as e:
+                    return jsonify({"msg": str(e)}), 400
+            if "description" in data: 
+                p.description = data.get("description")
+            if "category_id" in data:
+                try:
+                    p.category_id = int(data.get("category_id")) if data.get("category_id") else None
+                except:
+                    p.category_id = None
+            if "discount_percent" in data:
+                dp = data.get("discount_percent")
+                if dp is not None:
+                    if not _is_numeric_string(dp):
+                        return jsonify({"msg": "discount_percent numeric string formatında olmalı"}), 400
+                    p.discount_percent = str(dp)
+            
+            # Resim güncelleme - GÜVENLİ VERSİYON
+            if "image_base64" in data:
+                image_data = data.get("image_base64")
+                if image_data and image_data != "":
+                    # Yeni resim var, kaydet
+                    filename = save_base64_image(image_data)
+                    if filename:
+                        # Eski resmi GÜVENLİ bir şekilde sil
+                        if p.image_filename:
+                            safe_delete_image(p.image_filename)
+                        p.image_filename = filename
+                elif image_data == "" or image_data is None:
+                    # Boş string veya null geldiyse, resmi kaldır
+                    if p.image_filename:
+                        safe_delete_image(p.image_filename)
+                    p.image_filename = None
+
+        else:
+            data = request.form
+            if "title" in data: 
+                p.title = data["title"]
+            if "price" in data:
+                price_str = data["price"]
                 if not _is_numeric_string(price_str):
                     return jsonify({"msg": "price numeric string formatında olmalı"}), 400
                 p.price = str(price_str)
-        if "stock" in data:
-            try:
-                p.stock = _parse_stock_value(data.get("stock"))
-            except ValueError as e:
-                return jsonify({"msg": str(e)}), 400
-        if "description" in data: 
-            p.description = data.get("description")
-        if "category_id" in data:
-            try:
-                p.category_id = int(data.get("category_id"))
-            except:
-                p.category_id = None
-        if "discount_percent" in data:
-            dp = data.get("discount_percent")
-            if dp is not None:
+            if "stock" in data:
+                try:
+                    p.stock = _parse_stock_value(data["stock"])
+                except ValueError as e:
+                    return jsonify({"msg": str(e)}), 400
+            if "description" in data: 
+                p.description = data["description"]
+            if "category_id" in data:
+                try:
+                    p.category_id = int(data["category_id"]) if data["category_id"] else None
+                except:
+                    p.category_id = None
+            if "discount_percent" in data:
+                dp = data["discount_percent"]
                 if not _is_numeric_string(dp):
-                    return jsonify({"msg": "discount_percent numeric stringında olmalı"}), 400
+                    return jsonify({"msg": "discount_percent numeric string formatında olmalı"}), 400
                 p.discount_percent = str(dp)
-        
-        # Resim güncelleme - artık zorunlu değil
-        if "image_base64" in data:
-            image_data = data.get("image_base64")
-            if image_data is not None and image_data != "":
-                # Yeni resim var, kaydet
-                filename = save_base64_image(image_data)
-                if filename:
-                    # Eski resmi sil
-                    if p.image_filename:
-                        try:
-                            old_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
-                            if os.path.exists(old_path):
-                                os.remove(old_path)
-                        except Exception as e:
-                            app.logger.warning(f"Eski resim silinemedi: {e}")
-                    p.image_filename = filename
-            else:
-                # Boş string veya null geldiyse, resmi kaldır
-                if p.image_filename:
-                    try:
-                        old_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
-                        if os.path.exists(old_path):
-                            os.remove(old_path)
-                    except Exception as e:
-                        app.logger.warning(f"Eski resim silinemedi: {e}")
-                p.image_filename = None
+            
+            # Resim güncelleme - GÜVENLİ VERSİYON
+            if "image" in request.files:
+                file = request.files["image"]
+                if file and file.filename and file.filename != '':
+                    filename = save_uploaded_file(file)
+                    if filename:
+                        # Eski resmi GÜVENLİ bir şekilde sil
+                        if p.image_filename:
+                            safe_delete_image(p.image_filename)
+                        p.image_filename = filename
 
-    else:
-        data = request.form or {}
-        if "title" in data: 
-            p.title = data["title"]
-        if "price" in data:
-            price_str = data["price"]
-            if not _is_numeric_string(price_str):
-                return jsonify({"msg": "price numeric string formatında olmalı"}), 400
-            p.price = str(price_str)
-        if "stock" in data:
-            try:
-                p.stock = _parse_stock_value(data["stock"])
-            except ValueError as e:
-                return jsonify({"msg": str(e)}), 400
-        if "description" in data: 
-            p.description = data["description"]
-        if "category_id" in data:
-            try:
-                p.category_id = int(data["category_id"])
-            except:
-                p.category_id = None
-        if "discount_percent" in data:
-            dp = data["discount_percent"]
-            if not _is_numeric_string(dp):
-                return jsonify({"msg": "discount_percent numeric stringında olmalı"}), 400
-            p.discount_percent = str(dp)
-        
-        # Resim güncelleme - artık zorunlu değil
-        if "image" in request.files:
-            file = request.files["image"]
-            if file and file.filename:  # Dosya var ve boş değilse
-                filename = save_uploaded_file(file)
-                if filename:
-                    # Eski resmi sil
-                    if p.image_filename:
-                        try:
-                            old_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
-                            if os.path.exists(old_path):
-                                os.remove(old_path)
-                        except Exception as e:
-                            app.logger.warning(f"Eski resim silinemedi: {e}")
-                    p.image_filename = filename
+        db.session.commit()
 
-    db.session.commit()
+        # İndirim bildirimi
+        try:
+            if old_discount != str(p.discount_percent):
+                if float(str(p.discount_percent).replace(",", ".")) > 0:
+                    notify_result = notify_users_about_discount(p)
+                    app.logger.info(f"Discount notify result: {notify_result}")
+        except Exception as e:
+            app.logger.error(f"Discount bildirim hatası: {e}")
 
-    # If discount changed and >0, notify users
-    try:
-        if old_discount != str(p.discount_percent):
-            if float(str(p.discount_percent).replace(",", ".")) > 0:
-                notify_result = notify_users_about_discount(p)
-                app.logger.info(f"Discount notify result: {notify_result}")
-    except Exception:
-        pass
+        return jsonify({"msg": "Ürün güncellendi", "product_id": p.id})
 
-    return jsonify({"msg": "Ürün güncellendi"})
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Ürün güncelleme hatası: {str(e)}")
+        return jsonify({"msg": f"Ürün güncellenirken hata oluştu: {str(e)}"}), 500
 
 
 @app.route("/admin/products/<int:product_id>", methods=["DELETE"])
@@ -1140,16 +1168,9 @@ def delete_product(product_id):
                 "order_items_count": len(order_items)
             }), 400
         
-        # Resmi sil
+        # Resmi GÜVENLİ bir şekilde sil
         if p.image_filename:
-            try:
-                image_path = os.path.join(app.config['IMAGE_FOLDER'], p.image_filename)
-                if os.path.exists(image_path):
-                    os.remove(image_path)
-                    app.logger.info(f"Resim dosyası silindi: {p.image_filename}")
-            except Exception as e:
-                app.logger.warning(f"Resim dosyası silinemedi: {e}")
-                # Resim silinemese bile ürün silme işlemine devam et
+            safe_delete_image(p.image_filename)
         
         # Ürünü sil
         db.session.delete(p)
@@ -1163,6 +1184,7 @@ def delete_product(product_id):
         app.logger.error(f"Ürün silme hatası: {str(e)}")
         return jsonify({"msg": f"Ürün silinirken hata oluştu: {str(e)}"}), 500
 
+
 @app.route("/admin/products/<int:product_id>/discount", methods=["POST"])
 @admin_required
 def set_discount(product_id):
@@ -1172,7 +1194,7 @@ def set_discount(product_id):
         return jsonify({"msg": "discount_percent gerekli"}), 400
     dp = data.get("discount_percent")
     if dp is None or not _is_numeric_string(dp):
-        return jsonify({"msg": "discount_percent numeric stringında olmalı"}), 400
+        return jsonify({"msg": "discount_percent numeric string formatında olmalı"}), 400
     p.discount_percent = str(dp)
     db.session.commit()
 
@@ -2126,6 +2148,36 @@ def patch_admin_me():
         response["new_token"] = new_token
 
     return jsonify(response)
+
+
+# ---------- Cleanup Images Endpoint ----------
+@app.route("/admin/cleanup_images", methods=["POST"])
+@admin_required
+def cleanup_images():
+    """Boş veya var olmayan resim referanslarını temizler"""
+    try:
+        products = Product.query.filter(Product.image_filename.isnot(None)).all()
+        cleaned_count = 0
+        
+        for product in products:
+            if product.image_filename:
+                filepath = os.path.join(app.config['IMAGE_FOLDER'], product.image_filename)
+                if not os.path.exists(filepath):
+                    app.logger.info(f"Boş resim referansı temizlendi: {product.image_filename}")
+                    product.image_filename = None
+                    cleaned_count += 1
+        
+        db.session.commit()
+        
+        return jsonify({
+            "msg": f"{cleaned_count} boş resim referansı temizlendi",
+            "cleaned_count": cleaned_count
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Resim temizleme hatası: {e}")
+        return jsonify({"msg": f"Temizleme sırasında hata: {str(e)}"}), 500
 
 
 # ---------- Helpers used earlier: notify discount ----------
